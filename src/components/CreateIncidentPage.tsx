@@ -23,7 +23,7 @@ export const CreateIncidentPage: React.FC<CreateIncidentPageProps> = ({
 }) => {
   const [incidentId, setIncidentId] = useState<string>('INC-00459');
   const [title, setTitle] = useState<string>('');
-  const [database, setDatabase] = useState<string>('PNCPRD01');
+  const [database, setDatabase] = useState<string>('gcc_banking_core');
   const [severity, setSeverity] = useState<string>('HIGH');
   const [category, setCategory] = useState<string>('Database - PostgreSQL Fleet');
   const [assignedTo, setAssignedTo] = useState<string>('DBA Operations / Reliability Engineering');
@@ -50,7 +50,7 @@ export const CreateIncidentPage: React.FC<CreateIncidentPageProps> = ({
 
     if (anomaly) {
       setTitle(anomaly.title || `Performance Anomaly on ${anomaly.database}`);
-      setDatabase(anomaly.database || 'PNCPRD01');
+      setDatabase(anomaly.database || 'gcc_banking_core');
     } else {
       setTitle('Database Performance Anomaly — Requires DBA Inspection');
     }

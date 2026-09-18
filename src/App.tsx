@@ -15,13 +15,16 @@ import { DbaConsolePanel } from './components/DbaConsolePanel';
 import { TimelineFooter } from './components/TimelineFooter';
 import type { TimelineEntry } from './components/TimelineFooter';
 import { DemoControls } from './components/DemoControls';
+import { DatabaseStatus } from './components/DatabaseStatus';
+import type { ConnectionStatus } from './components/DatabaseStatus';
+import { DatabaseExplorer } from './components/DatabaseExplorer';
 import './index.css';
 
 // Default initial state matching Section 11/12 spec
 const DEFAULT_FLEET: FleetItem[] = [
-  { name: 'PNCPRD01', status: 'AT_RISK', risk_score: 88, status_desc: 'Primary cluster · Lock contention detected' },
-  { name: 'RECON_DB', status: 'HEALTHY', risk_score: 12, status_desc: 'Reconciliation service · Healthy' },
-  { name: 'MBL_STG', status: 'HEALTHY', risk_score: 8, status_desc: 'Mobile staging · Healthy' }
+  { name: 'gcc_banking_core', status: 'AT_RISK', risk_score: 88, status_desc: 'Banking core · Simulated anomaly' },
+  { name: 'gcc_reconciliation', status: 'HEALTHY', risk_score: 10, status_desc: 'Reconciliation · Awaiting telemetry' },
+  { name: 'gcc_audit_service', status: 'HEALTHY', risk_score: 10, status_desc: 'Audit service · Awaiting telemetry' }
 ];
 
 const DEFAULT_KPIS: KpiData = {
@@ -33,8 +36,8 @@ const DEFAULT_KPIS: KpiData = {
 
 const DEFAULT_ANOMALY: AnomalyInfo = {
   type: 'LOCK_CONTENTION',
-  database: 'PNCPRD01',
-  title: 'Lock contention on public.orders (PID 48219 holding exclusive tuple lock)',
+  database: 'gcc_banking_core',
+  title: 'Simulated lock contention on public.orders',
   target_table: 'public.orders',
   blocking_pid: 48219,
   wait_event: 'Lock:tuple',
@@ -43,7 +46,7 @@ const DEFAULT_ANOMALY: AnomalyInfo = {
 };
 
 const DEFAULT_DIAGNOSIS: DiagnosisData = {
-  model: 'Claude 3.5 Sonnet (RAG Grounded)',
+  model: 'dbpulse deterministic RAG fallback',
   root_cause: 'Session PID 48219 has held an uncommitted row lock on table public.orders for over 180s during a bulk update batch. This block is cascading to 4 subsequent transactions attempting write locks on the same partition.',
   citations: 'source: pg_stat_activity, pg_locks',
   remediation_steps: [
@@ -72,12 +75,16 @@ export function App() {
   const [incident, setIncident] = useState<IncidentData | null>(null);
   const [timeline, setTimeline] = useState<TimelineEntry[]>([
     { timestamp: '14:00:00', event: 'Fleet monitoring initialized', type: 'system' },
-    { timestamp: '14:02:15', event: 'PNCPRD01: Anomaly detected (Lock Contention)', type: 'anomaly' },
-    { timestamp: '14:02:18', event: 'PNCPRD01 diagnosed by dbpulse (Claude 3.5 Sonnet)', type: 'diagnosis' }
+    { timestamp: '14:02:15', event: 'gcc_banking_core: Simulated anomaly selected (Lock Contention)', type: 'anomaly' },
+    { timestamp: '14:02:18', event: 'gcc_banking_core diagnosed by dbpulse (deterministic RAG fallback)', type: 'diagnosis' }
   ]);
   const [lastPolledSecAgo, setLastPolledSecAgo] = useState(2);
   const [activeScenario, setActiveScenario] = useState('LOCK_CONTENTION');
   const [isDiagnosing, setIsDiagnosing] = useState(false);
+  const [connection, setConnection] = useState<ConnectionStatus>({
+    state: 'checking', message: 'Waiting for a backend telemetry check. Initial dashboard values are demo data.',
+  });
+  const [selectedDatabase, setSelectedDatabase] = useState('gcc_banking_core');
 
   // Hash-based back/forward routing support
   useEffect(() => {
@@ -104,42 +111,52 @@ export function App() {
 
   // Poll backend API (with client fallback)
   useEffect(() => {
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout>;
     const fetchData = async () => {
       try {
-        const fleetRes = await fetch('/api/fleet');
+        const fleetRes = await fetch('/api/fleet', { signal: AbortSignal.timeout(15000) });
+        if (!fleetRes.ok) throw new Error('Fleet request failed');
         if (fleetRes.ok) {
           const fleetData = await fleetRes.json();
           setFleet(fleetData.fleet);
           setLastPolledSecAgo(fleetData.last_polled_sec_ago || 1);
         }
 
-        const kpiRes = await fetch('/api/kpis?db=PNCPRD01');
+        const kpiRes = await fetch(`/api/kpis?db=${encodeURIComponent(selectedDatabase)}`, { signal: AbortSignal.timeout(15000) });
+        if (!kpiRes.ok) throw new Error('KPI request failed');
         if (kpiRes.ok) {
           const kpiData = await kpiRes.json();
           setKpis(kpiData.kpis);
+          setConnection(kpiData.connection ?? {
+            state: 'unknown', message: 'This backend does not report database status. Restart it with the updated code.',
+          });
         }
 
-        const anomalyRes = await fetch('/api/anomaly');
+        const anomalyRes = await fetch('/api/anomaly', { signal: AbortSignal.timeout(15000) });
         if (anomalyRes.ok) {
           const anomalyData = await anomalyRes.json();
           setAnomaly(anomalyData.anomaly);
         }
 
-        const timelineRes = await fetch('/api/timeline');
+        const timelineRes = await fetch('/api/timeline', { signal: AbortSignal.timeout(15000) });
         if (timelineRes.ok) {
           const timelineData = await timelineRes.json();
           setTimeline(timelineData.timeline);
         }
       } catch {
+        setConnection({ state: 'unavailable', message: 'Could not complete the backend poll. Live database connectivity is not confirmed.' });
         // Increment timer if running standalone
         setLastPolledSecAgo(prev => (prev >= 5 ? 1 : prev + 1));
+      } finally {
+        // Avoid piling up database requests when a connection is slow or unavailable.
+        if (!stopped) timer = setTimeout(fetchData, 3000);
       }
     };
 
     fetchData();
-    const interval = setInterval(fetchData, 3000);
-    return () => clearInterval(interval);
-  }, []);
+    return () => { stopped = true; clearTimeout(timer); };
+  }, [selectedDatabase]);
 
   // Handle Scenario Switch
   const handleSelectScenario = async (scenario: string) => {
@@ -168,20 +185,20 @@ export function App() {
         setDiagnosis(DEFAULT_DIAGNOSIS);
       } else if (scenario === 'POOL_EXHAUSTION') {
         setFleet([
-          { name: 'PNCPRD01', status: 'AT_RISK', risk_score: 92, status_desc: 'Primary cluster · Connection pool exhaustion' },
-          { name: 'RECON_DB', status: 'HEALTHY', risk_score: 14, status_desc: 'Reconciliation service · Healthy' },
-          { name: 'MBL_STG', status: 'HEALTHY', risk_score: 5, status_desc: 'Mobile staging · Healthy' }
+          { name: 'gcc_banking_core', status: 'AT_RISK', risk_score: 92, status_desc: 'Banking core · Simulated connection pool exhaustion' },
+          { name: 'gcc_reconciliation', status: 'HEALTHY', risk_score: 10, status_desc: 'Reconciliation · Demo healthy' },
+          { name: 'gcc_audit_service', status: 'HEALTHY', risk_score: 10, status_desc: 'Audit service · Demo healthy' }
         ]);
         setKpis({ active_sessions: 98, blocked_sessions: 24, cache_hit_ratio: 96.2, avg_query_time_ms: 1420 });
         setAnomaly({
           type: 'POOL_EXHAUSTION',
-          database: 'PNCPRD01',
+          database: 'gcc_banking_core',
           title: 'Max connections reached (98/100 active connections in ClientRead wait)',
           target_table: 'global_pool'
         });
         setDiagnosis({
-          model: 'Claude 3.5 Sonnet (RAG Grounded)',
-          root_cause: 'Active connection count reached 98/100 limit on PNCPRD01 due to connection pool leakage from application workers.',
+          model: 'dbpulse deterministic RAG fallback',
+          root_cause: 'A simulated connection pool exhaustion scenario was selected for gcc_banking_core.',
           citations: 'source: pg_stat_activity, pg_stat_database',
           remediation_steps: [
             { step: 1, title: 'Inspect idle connections', sql: "SELECT pid, state, now() - state_change FROM pg_stat_activity WHERE state = 'idle in transaction';" },
@@ -191,19 +208,19 @@ export function App() {
         });
       } else if (scenario === 'RUNAWAY_QUERY') {
         setFleet([
-          { name: 'PNCPRD01', status: 'AT_RISK', risk_score: 78, status_desc: 'Primary cluster · Runaway unindexed sequential scan' },
-          { name: 'RECON_DB', status: 'HEALTHY', risk_score: 10, status_desc: 'Reconciliation service · Healthy' },
-          { name: 'MBL_STG', status: 'HEALTHY', risk_score: 6, status_desc: 'Mobile staging · Healthy' }
+          { name: 'gcc_banking_core', status: 'HEALTHY', risk_score: 10, status_desc: 'Banking core · Demo healthy' },
+          { name: 'gcc_reconciliation', status: 'HEALTHY', risk_score: 10, status_desc: 'Reconciliation · Demo healthy' },
+          { name: 'gcc_audit_service', status: 'AT_RISK', risk_score: 78, status_desc: 'Audit service · Simulated sequential scan' }
         ]);
         setKpis({ active_sessions: 31, blocked_sessions: 0, cache_hit_ratio: 84.1, avg_query_time_ms: 2100 });
         setAnomaly({
           type: 'RUNAWAY_QUERY',
-          database: 'PNCPRD01',
-          title: 'Runaway query PID 31092 scanning 42M rows without index on audit_logs',
+          database: 'gcc_audit_service',
+          title: 'Simulated runaway scan on public.audit_logs',
           target_table: 'public.audit_logs'
         });
         setDiagnosis({
-          model: 'Claude 3.5 Sonnet (RAG Grounded)',
+          model: 'dbpulse deterministic RAG fallback',
           root_cause: 'Runaway query PID 31092 scanning 42M rows sequentially on public.audit_logs due to missing predicate index.',
           citations: 'source: pg_stat_activity, DataFileRead wait events',
           remediation_steps: [
@@ -230,9 +247,9 @@ export function App() {
     }
 
     setFleet([
-      { name: 'PNCPRD01', status: 'HEALTHY', risk_score: 10, status_desc: 'Primary cluster · Healthy' },
-      { name: 'RECON_DB', status: 'HEALTHY', risk_score: 12, status_desc: 'Reconciliation service · Healthy' },
-      { name: 'MBL_STG', status: 'HEALTHY', risk_score: 8, status_desc: 'Mobile staging · Healthy' }
+      { name: 'gcc_banking_core', status: 'HEALTHY', risk_score: 10, status_desc: 'Banking core · Healthy' },
+      { name: 'gcc_reconciliation', status: 'HEALTHY', risk_score: 10, status_desc: 'Reconciliation · Healthy' },
+      { name: 'gcc_audit_service', status: 'HEALTHY', risk_score: 10, status_desc: 'Audit service · Healthy' }
     ]);
     setKpis({ active_sessions: 12, blocked_sessions: 0, cache_hit_ratio: 99.8, avg_query_time_ms: 14 });
     setAnomaly(null);
@@ -274,6 +291,8 @@ export function App() {
         onToggleMode={handleToggleMode}
       />
 
+      <DatabaseStatus connection={connection} />
+
       {currentView === 'create-incident' ? (
         <CreateIncidentPage
           anomaly={anomaly}
@@ -285,8 +304,9 @@ export function App() {
         />
       ) : (
         <>
-          <FleetStrip fleet={fleet} />
+          <FleetStrip fleet={fleet} selectedDatabase={selectedDatabase} onSelect={setSelectedDatabase} />
           <KpiRow kpis={kpis} />
+          <DatabaseExplorer database={selectedDatabase} />
           <AnomalyBanner anomaly={anomaly} />
 
           {appMode === 'agent' ? (

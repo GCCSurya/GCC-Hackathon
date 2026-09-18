@@ -4,7 +4,8 @@ import logging
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 
-from db_monitor import DBMonitor
+from multi_db_monitor import MultiDBMonitor
+from incident_store import IncidentStore
 from rag_engine import RAGEngine
 from agent import AgentEngine
 
@@ -15,16 +16,21 @@ app = Flask(__name__, static_folder="../dist", static_url_path="")
 CORS(app)
 
 # Initialize modules
-db_monitor = DBMonitor()
+db_monitor = MultiDBMonitor()
+incident_store = IncidentStore()
 rag_engine = RAGEngine()
 agent_engine = AgentEngine(rag_engine)
 
 # In-memory timeline state
 timeline_events = [
     {"timestamp": "14:00:00", "event": "Fleet monitoring initialized", "type": "system"},
-    {"timestamp": "14:02:15", "event": "PNCPRD01: Anomaly detected (Lock Contention)", "type": "anomaly"}
+    {"timestamp": "14:02:15", "event": "gcc_banking_core: Simulated anomaly selected (Lock Contention)", "type": "anomaly"}
 ]
 incidents_db = []
+
+@app.route("/healthz", methods=["GET"])
+def get_liveness():
+    return jsonify({"status": "ok"})
 
 @app.route("/api/fleet", methods=["GET"])
 def get_fleet():
@@ -35,14 +41,25 @@ def get_fleet():
         "last_polled_sec_ago": int(time.time() - db_monitor.last_poll_time)
     })
 
+@app.route("/api/db-health", methods=["GET"])
+def get_db_health():
+    # Exercise the actual monitoring queries, not the synthetic fallback alone.
+    db_monitor.poll_metrics()
+    status = db_monitor.get_connection_status()
+    connected = status["state"] == "connected"
+    return jsonify({"success": connected, "connection": status}), 200 if connected else 503
+
 @app.route("/api/kpis", methods=["GET"])
 def get_kpis():
-    db_name = request.args.get("db", "PNCPRD01")
+    db_name = request.args.get("db", "gcc_banking_core")
     metrics = db_monitor.poll_metrics()
-    db_metrics = metrics.get(db_name, metrics["PNCPRD01"])
+    if db_name not in metrics:
+        return jsonify({"success": False, "error": "Unknown configured database"}), 404
+    db_metrics = metrics[db_name]
     return jsonify({
         "success": True,
         "database": db_name,
+        "connection": db_monitor.get_connection_status(),
         "kpis": {
             "active_sessions": db_metrics["active_sessions"],
             "blocked_sessions": db_metrics["blocked_sessions"],
@@ -51,6 +68,28 @@ def get_kpis():
         }
     })
 
+@app.route("/api/databases/<database>/tables", methods=["GET"])
+def get_database_tables(database):
+    try:
+        tables = db_monitor.get_inventory(database)
+    except ValueError as error:
+        return jsonify({"success": False, "error": str(error)}), 404
+    except Exception as error:
+        logger.warning("Table inventory failed for %s (%s)", database, type(error).__name__)
+        return jsonify({"success": False, "error": "Table inventory query failed"}), 503
+    return jsonify({"success": True, "database": database, "tables": tables})
+
+@app.route("/api/databases/<database>/tables/<table>/rows", methods=["GET"])
+def get_table_rows(database, table):
+    try:
+        preview = db_monitor.get_table_preview(database, table, request.args.get("limit", 20, type=int))
+    except ValueError as error:
+        return jsonify({"success": False, "error": str(error)}), 404
+    except Exception as error:
+        logger.warning("Table preview failed for %s.%s (%s)", database, table, type(error).__name__)
+        return jsonify({"success": False, "error": "Table preview query failed"}), 503
+    return jsonify({"success": True, "database": database, "table": table, **preview})
+
 @app.route("/api/anomaly", methods=["GET"])
 def get_anomaly():
     anomaly = db_monitor.get_active_anomaly()
@@ -58,6 +97,10 @@ def get_anomaly():
         "success": True,
         "anomaly": anomaly
     })
+
+@app.route("/api/agent-status", methods=["GET"])
+def get_agent_status():
+    return jsonify({"success": True, "agent": agent_engine.get_status()})
 
 @app.route("/api/diagnose", methods=["POST"])
 def run_diagnosis():
@@ -69,7 +112,7 @@ def run_diagnosis():
     now_str = time.strftime("%H:%M:%S")
     timeline_events.append({
         "timestamp": now_str,
-        "event": f"PNCPRD01 diagnosed by dbpulse ({diagnosis.get('model', 'Agent')})",
+        "event": f"{anomaly.get('database', 'gcc_banking_core') if anomaly else 'gcc_banking_core'} diagnosed by dbpulse ({diagnosis.get('model', 'Agent')})",
         "type": "diagnosis"
     })
     
@@ -80,7 +123,11 @@ def run_diagnosis():
 
 @app.route("/api/next-incident-id", methods=["GET"])
 def get_next_incident_id():
-    inc_id = f"INC-00{len(incidents_db) + 458}"
+    try:
+        inc_id = incident_store.get_next_incident_id()
+    except Exception as error:
+        logger.warning("Next incident ID query failed (%s)", type(error).__name__)
+        return jsonify({"success": False, "error": "Incident database query failed"}), 503
     return jsonify({
         "success": True,
         "next_incident_id": inc_id
@@ -99,7 +146,7 @@ def raise_incident():
         "incident_id": inc_id,
         "severity": data.get("severity", "HIGH"),
         "title": data.get("title") or (anomaly.get("title", "PostgreSQL Database Anomaly") if anomaly else "DB Incident"),
-        "database": data.get("database") or (anomaly.get("database", "PNCPRD01") if anomaly else "PNCPRD01"),
+        "database": data.get("database") or (anomaly.get("database", "gcc_banking_core") if anomaly else "gcc_banking_core"),
         "category": data.get("category", "Database - PostgreSQL Fleet"),
         "assigned_to": data.get("assigned_to", "DBA on-call"),
         "raised_by": data.get("raised_by", "dbpulse agent"),
@@ -108,6 +155,12 @@ def raise_incident():
         "remediation_steps": data.get("remediation_steps") or diagnosis.get("remediation_steps"),
         "notes": data.get("notes", "")
     }
+    try:
+        incident_store.save(incident)
+    except Exception as error:
+        logger.warning("Incident persistence failed (%s)", type(error).__name__)
+        return jsonify({"success": False, "error": "Incident could not be stored"}), 503
+
     incidents_db.append(incident)
     
     timeline_events.append({

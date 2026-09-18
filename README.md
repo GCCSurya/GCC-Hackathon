@@ -89,7 +89,7 @@ Dark technical console designed specifically for database reliability engineers 
 ## ⚡ Quickstart Guide
 
 ### Prerequisites
-- Node.js 18+ & npm
+- Node.js 20.19+ or 22.12+ (supported by Vite 8) & npm
 - Python 3.11+
 
 ### 1. Backend Setup & Run
@@ -123,6 +123,81 @@ npm run dev
 ---
 
 ## 🎮 How to Run & Test in Both Modes
+
+### Verify Azure PostgreSQL connectivity (Windows PowerShell)
+
+pgAdmin and dbpulse connect independently. A working pgAdmin session or dashboard
+does not prove that the backend has received database credentials. Run the following
+in the same terminal that will start the backend, using the connection details from
+pgAdmin's server properties:
+
+```powershell
+$env:PGHOST = "<server>.postgres.database.azure.com"
+$env:PGPORT = "5432"
+$env:PGDATABASE = "<database>"
+$env:PGUSER = "<monitoring-user>"
+$env:PGSSLMODE = "require"
+$credential = Get-Credential -UserName $env:PGUSER -Message "Enter database credentials privately"
+$env:PGPASSWORD = $credential.GetNetworkCredential().Password
+
+# From the project root, after stopping the old backend with Ctrl+C:
+python backend/app.py
+```
+
+Do not paste passwords into chat, source files, or command literals. Variables apply
+only to this terminal and its child processes. `POSTGRES_URL` / `DATABASE_URL`, if
+set, take precedence over `PG*` settings; remove stale URL variables when switching
+to this setup. The current startup code does **not** automatically load `.env` files.
+
+After rebuilding the frontend (`npm run build`) and restarting Flask, open
+`http://localhost:5000`. The database status banner distinguishes:
+
+- **PostgreSQL connected · Mixed live/demo data:** monitoring queries succeeded.
+   PNCPRD01 uses live session counts and available cache statistics. Demo scenarios,
+   peer databases, risk scores, query-time estimates and other values remain simulated.
+- **Demo data · Database not configured:** this backend process has no database target.
+- **Demo fallback · Database check failed:** connection or monitoring queries failed.
+- **Backend unavailable / status unknown:** connectivity is not confirmed; check the
+   backend process and restart it if it predates the status endpoint.
+
+For a direct check, open `http://localhost:5000/api/db-health`. It executes the
+read-only monitoring queries and returns HTTP **200** only when they succeed;
+HTTP **503** with a credential-free reason means live telemetry is unavailable.
+An HTTP 200 from `/api/fleet` or `/api/kpis` alone is not proof of a live database.
+
+### Configure Azure AI Foundry agent diagnoses
+
+The checked-in launcher selects `gpt-5.6-sol`. Use managed identity when the VM
+has an Azure inference role:
+
+```powershell
+.\start-dbpulse.ps1
+```
+
+The VM identity needs `Azure AI User` or `Cognitive Services OpenAI User` on the
+Foundry resource. If RBAC cannot be assigned, rotate the previously exposed key
+and use the API-key mode. Enter the new key only at the masked terminal prompt;
+do not put it in chat, source files, or command arguments:
+
+```powershell
+.\start-dbpulse.ps1 -Authentication ApiKey
+```
+
+The launcher removes the key from its environment when Flask exits. Verify
+non-secret configuration at
+`http://localhost:5000/api/agent-status`; `configured` must be `true` and
+`authentication` must match the selected mode. Trigger a diagnosis and confirm
+its model label includes `gpt-5.6-sol`. If Azure rejects authentication, the live
+call falls back to deterministic RAG and labels the result accurately.
+
+Monitoring uses read-only transactions, a 3-second connection timeout and a
+5-second per-statement timeout. Use a monitoring account with suitable permissions;
+do not run cancellation/termination SQL against the shared database for demo testing.
+Incidents are persisted in `test.public.incidents`, and LLM connectivity is
+separate from DB connectivity.
+
+For now, Flask on port 5000 is the recommended full-stack entry point. Vite's dev
+server needs an `/api` proxy to Flask before its relative API calls reach the backend.
 
 Once the app is running at `http://localhost:5000` (or `http://localhost:5173`), follow these steps to experience and evaluate both operational modes:
 

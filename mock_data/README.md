@@ -2,6 +2,102 @@
 
 This directory contains pre-generated mockup data CSV files, database schemas, and import scripts for testing the **dbpulse** PostgreSQL Reliability Agent on your VM.
 
+## Three-Database GCC Fleet
+
+The dashboard is configured for these existing databases:
+
+| Database | Seeded tables |
+| :--- | :--- |
+| `gcc_banking_core` | `customers`, `accounts`, `orders`, `transactions` |
+| `gcc_reconciliation` | `recon_records`, `recon_batches`, `recon_exceptions`, `source_systems` |
+| `gcc_audit_service` | `audit_logs`, `application_users`, `security_events`, `event_rules` |
+
+To seed all three from pgAdmin's PSQL Tool, run:
+
+```text
+\cd 'C:/Users/GCCHackVM.ILB-3790VM-67/Desktop/GCC-Hackathon/mock_data'
+\i seed_gcc_fleet.sql
+```
+
+Each database script runs in its own transaction, stops on the first error, and
+creates tables without `DROP` or `IF NOT EXISTS`. This intentionally refuses to
+overwrite an existing table. Because PostgreSQL transactions do not span
+databases, an error in a later database does not undo an earlier database's
+successful commit. Review the error instead of dropping existing objects.
+
+After seeding, restart the Flask backend in the terminal containing the `PG*`
+credentials. The monitor reuses the same host and credentials but connects to
+each configured database by name. Select a fleet row to view its live KPIs,
+table counts, and a read-only preview limited to 20 rows.
+
+### Incident Store
+
+Incident reports are stored in `test.public.incidents`. In pgAdmin's PSQL Tool,
+connect to the `test` database and run:
+
+```text
+\cd 'C:/Users/GCCHackVM.ILB-3790VM-67/Desktop/GCC-Hackathon/mock_data'
+\i seed_incident_store.sql
+```
+
+The backend uses `INCIDENT_DATABASE=test` by default. Set `INCIDENT_DATABASE`
+before starting Flask if the system database has a different name.
+
+## Safe Import Into the Shared Azure Database
+
+Use `seed_demo.sql` for the assigned Azure database `test`. Do not run
+`schema.sql` directly against a shared database: it drops existing tables with
+`CASCADE`.
+
+The safe entry point creates a new `dbpulse_demo` schema, then loads all five
+CSV files in a single transaction. It stops on the first error and refuses to
+run if that schema already exists. It does not overwrite existing data or
+perform an ongoing synchronization. On failure, the transaction is rolled back
+when psql exits. This requires permission to create a schema in `test`.
+
+In PowerShell, from the repository root, use the terminal where your `PGHOST`,
+`PGPORT`, `PGDATABASE`, `PGUSER`, `PGSSLMODE`, and private `PGPASSWORD` are set:
+
+```powershell
+Push-Location .\mock_data
+try {
+	psql -X -h $env:PGHOST -p $env:PGPORT -U $env:PGUSER -d $env:PGDATABASE -f .\seed_demo.sql
+	if ($LASTEXITCODE -ne 0) { throw 'Demo import failed; no transaction was committed.' }
+} finally {
+	Pop-Location
+}
+```
+
+`psql` must be installed and on PATH. It reads these CSVs from your computer;
+server-side filesystem access is not needed. Without `PGPASSWORD`, psql may
+prompt for the password privately. Never paste passwords into chat. Set
+`PGSSLMODE=require` for Azure. PostgreSQL client commands use `PG*` settings;
+the backend additionally recognizes `POSTGRES_URL` and `DATABASE_URL`, which
+override its `PG*` settings. Ensure both tools target the same database.
+
+After a successful commit, verify counts in pgAdmin connected to `test`:
+
+```sql
+SELECT 'customers' AS table_name, count(*) FROM dbpulse_demo.customers
+UNION ALL SELECT 'accounts', count(*) FROM dbpulse_demo.accounts
+UNION ALL SELECT 'orders', count(*) FROM dbpulse_demo.orders
+UNION ALL SELECT 'audit_logs', count(*) FROM dbpulse_demo.audit_logs
+UNION ALL SELECT 'recon_records', count(*) FROM dbpulse_demo.recon_records;
+```
+
+Expected counts are 500, 1,000, 5,000, 10,000, and 2,500 respectively.
+If the schema already exists, inspect its data before choosing a merge or
+replacement strategy; do not drop it just to rerun the seed.
+
+Next, restart the updated backend in its credential-configured terminal and
+check `/api/db-health`. A 200 response with `connection.state=connected`
+confirms monitoring queries work. Importing rows does not generate active
+sessions or lock contention, and the dashboard still mixes live and demo
+metrics. Existing scenario SQL and remediation suggestions reference
+`public.orders` or `public.audit_logs`; do not execute them against the shared
+database. Any later workload must explicitly target `dbpulse_demo` and be
+bounded and separately approved.
+
 ---
 
 ## 📁 Files Overview

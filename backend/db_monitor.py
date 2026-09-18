@@ -2,6 +2,7 @@ import os
 import time
 import random
 import logging
+from datetime import datetime, timezone
 
 logger = logging.getLogger("db_monitor")
 
@@ -15,6 +16,14 @@ class DBMonitor:
         self.pgdatabase = os.getenv("PGDATABASE", "postgres")
         self.pgport = os.getenv("PGPORT", "5432")
         self.pgsslmode = os.getenv("PGSSLMODE", "require")
+        self.connection_status = {
+            "state": "unchecked" if self.pg_url or self.pghost else "not_configured",
+            "data_source": "demo",
+            "checked_at": None,
+            "message": "Connection not checked yet." if self.pg_url or self.pghost else
+                       "No PostgreSQL configuration in this backend process. Showing demo data.",
+            "error_type": None,
+        }
         
         self.active_scenario = "LOCK_CONTENTION"  # Default scenario for demo
         self.last_poll_time = time.time()
@@ -27,15 +36,21 @@ class DBMonitor:
             return True
         return False
 
+    def get_connection_status(self):
+        """Return credential-free status of the latest telemetry attempt."""
+        return dict(self.connection_status)
+
     def poll_metrics(self):
         self.last_poll_time = time.time()
+        self.connection_status["checked_at"] = datetime.now(timezone.utc).isoformat()
         
         # Try real PostgreSQL if configured
         if self.pg_url or self.pghost:
+            conn = None
             try:
                 import psycopg2
                 if self.pg_url:
-                    conn = psycopg2.connect(self.pg_url, connect_timeout=3)
+                    conn = psycopg2.connect(self.pg_url, connect_timeout=3, options="-c statement_timeout=5000")
                 else:
                     conn = psycopg2.connect(
                         host=self.pghost,
@@ -44,8 +59,10 @@ class DBMonitor:
                         dbname=self.pgdatabase,
                         port=self.pgport,
                         sslmode=self.pgsslmode,
-                        connect_timeout=3
+                        connect_timeout=3,
+                        options="-c statement_timeout=5000"
                     )
+                conn.set_session(readonly=True)
                 cursor = conn.cursor()
                 
                 # 1. Query active & blocked sessions on current database (modern Postgres compatible)
@@ -97,7 +114,6 @@ class DBMonitor:
                 cache_hit = db_row[0] if db_row and db_row[0] is not None else 99.4
                 
                 cursor.close()
-                conn.close()
                 
                 # Determine PNCPRD01 anomaly & status based on live telemetry and active scenario
                 if blocked > 0:
@@ -168,12 +184,18 @@ class DBMonitor:
                     pnc_anomaly = None
 
                 logger.info(f"Polled live PostgreSQL (PNCPRD01): active={active}, blocked={blocked}, cache_hit={cache_hit:.1f}%")
+                self.connection_status.update(
+                    state="connected",
+                    data_source="mixed",
+                    error_type=None,
+                    message="PostgreSQL telemetry queries succeeded. PNCPRD01 uses live session counts and available cache statistics; demo scenarios, peer databases and other values remain simulated.",
+                )
                 return {
                     "PNCPRD01": {
                         "status": pnc_status,
                         "risk_score": pnc_risk,
                         "status_desc": pnc_desc,
-                        "active_sessions": active if active > 0 else (42 if pnc_status == "AT_RISK" else 12),
+                        "active_sessions": active,
                         "blocked_sessions": blocked,
                         "cache_hit_ratio": round(float(cache_hit), 1),
                         "avg_query_time_ms": pnc_avg_query,
@@ -201,7 +223,18 @@ class DBMonitor:
                     }
                 }
             except Exception as e:
-                logger.warning(f"Real Postgres connect failed ({e}), using synthetic engine")
+                # Raw driver errors can contain connection strings or credentials.
+                error_type = type(e).__name__
+                logger.warning("PostgreSQL telemetry failed (%s); using demo data", error_type)
+                self.connection_status.update(
+                    state="error",
+                    data_source="demo",
+                    error_type=error_type,
+                    message="PostgreSQL connection or telemetry query failed. Showing demo data; check credentials, network access and monitoring permissions.",
+                )
+            finally:
+                if conn is not None:
+                    conn.close()
         
         # Synthetic simulation engine fallback
         return self._get_synthetic_metrics()

@@ -143,6 +143,25 @@ body {
   background: var(--bg-card-hover);
 }
 
+.fleet-row[role="button"] { cursor: pointer; }
+.fleet-row.selected { outline: 1px solid var(--agent-teal); background: var(--bg-card-hover); }
+.source-chip { font: 10px var(--font-mono); text-transform: uppercase; padding: 2px 5px; border: 1px solid var(--border-color); border-radius: 3px; }
+.source-chip.live { color: var(--healthy-sage); }
+.source-chip.demo { color: var(--dba-amber); }
+
+.database-explorer { display: flex; flex-direction: column; gap: 12px; }
+.explorer-header { display: flex; align-items: end; justify-content: space-between; gap: 16px; }
+.explorer-header h2 { font: 600 16px var(--font-mono); }
+.explorer-header > span { color: var(--text-secondary); font-size: 12px; }
+.table-tabs { display: flex; gap: 8px; overflow-x: auto; }
+.table-tabs button { min-width: 150px; text-align: left; color: var(--text-primary); background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 4px; padding: 9px 10px; font: 12px var(--font-mono); cursor: pointer; }
+.table-tabs button.active { border-color: var(--agent-teal); background: var(--agent-teal-glow); }
+.table-tabs small { display: block; color: var(--text-secondary); margin-top: 3px; }
+.data-table-wrap { overflow: auto; max-height: 360px; border: 1px solid var(--border-color); border-radius: 4px; }
+.data-table { width: 100%; border-collapse: collapse; font: 11px var(--font-mono); white-space: nowrap; }
+.data-table th, .data-table td { padding: 8px 10px; border-bottom: 1px solid var(--border-color); text-align: left; max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
+.data-table th { position: sticky; top: 0; background: #171b20; color: var(--agent-teal); }
+
 .fleet-row.at-risk {
   border-left: 3px solid var(--risk-coral);
 }
