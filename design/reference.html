@@ -1,0 +1,644 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>dbpulse — Postgres Reliability Agent Reference</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,400;0,500;0,600;1,400&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg-dark: #14171C;
+      --bg-card: #1C2026;
+      --bg-card-hover: #222730;
+      --text-primary: #E7E4DC;
+      --text-secondary: #8B9099;
+      --border-color: #2A2E35;
+      
+      --agent-teal: #3FA9A0;
+      --agent-teal-glow: rgba(63, 169, 160, 0.16);
+      --agent-teal-border: rgba(63, 169, 160, 0.25);
+      
+      --risk-coral: #D9643A;
+      --risk-coral-bg: rgba(217, 100, 58, 0.12);
+      
+      --healthy-sage: #5B8C6E;
+      --healthy-sage-bg: rgba(91, 140, 110, 0.12);
+
+      --font-sans: 'IBM Plex Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+      --font-mono: 'IBM Plex Mono', monospace;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      background-color: var(--bg-dark);
+      color: var(--text-primary);
+      font-family: var(--font-sans);
+      font-size: 14px;
+      line-height: 1.5;
+      min-height: 100vh;
+      padding: 24px 32px;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .container {
+      max-width: 1100px;
+      margin: 0 auto;
+      display: flex;
+      flex-direction: column;
+      gap: 24px;
+    }
+
+    /* 1. Header */
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding-bottom: 16px;
+      border-bottom: 1px solid var(--border-color);
+    }
+
+    .brand {
+      display: flex;
+      align-items: baseline;
+      gap: 12px;
+    }
+
+    .brand-title {
+      font-family: var(--font-mono);
+      font-size: 20px;
+      font-weight: 600;
+      letter-spacing: -0.5px;
+      color: var(--text-primary);
+    }
+
+    .brand-subtitle {
+      font-size: 13px;
+      color: var(--text-secondary);
+      font-weight: 400;
+    }
+
+    .status-badge {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-family: var(--font-mono);
+      font-size: 12px;
+      color: var(--text-secondary);
+      background: rgba(255, 255, 255, 0.03);
+      padding: 6px 12px;
+      border-radius: 4px;
+      border: 1px solid var(--border-color);
+    }
+
+    .pulse-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background-color: var(--healthy-sage);
+      box-shadow: 0 0 8px var(--healthy-sage);
+      animation: pulse 2s infinite;
+    }
+
+    @keyframes pulse {
+      0% { opacity: 1; }
+      50% { opacity: 0.4; }
+      100% { opacity: 1; }
+    }
+
+    /* 2. Fleet Strip */
+    .fleet-section {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .section-label {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: var(--text-secondary);
+      margin-bottom: 4px;
+    }
+
+    .fleet-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .fleet-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 10px 14px;
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: 4px;
+      transition: background-color 0.15s ease;
+    }
+
+    .fleet-row:hover {
+      background: var(--bg-card-hover);
+    }
+
+    .fleet-row.at-risk {
+      border-left: 3px solid var(--risk-coral);
+    }
+
+    .fleet-row.healthy {
+      border-left: 3px solid var(--healthy-sage);
+    }
+
+    .fleet-info {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .status-tick {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+    }
+
+    .status-tick.coral { background: var(--risk-coral); box-shadow: 0 0 6px var(--risk-coral); }
+    .status-tick.sage { background: var(--healthy-sage); }
+
+    .db-name {
+      font-family: var(--font-mono);
+      font-weight: 600;
+      font-size: 13px;
+    }
+
+    .db-status-desc {
+      font-size: 12px;
+      color: var(--text-secondary);
+      font-family: var(--font-mono);
+    }
+
+    .risk-score {
+      font-family: var(--font-mono);
+      font-weight: 600;
+      font-size: 12px;
+      padding: 2px 8px;
+      border-radius: 3px;
+    }
+
+    .risk-score.high {
+      color: var(--risk-coral);
+      background: var(--risk-coral-bg);
+    }
+
+    .risk-score.normal {
+      color: var(--healthy-sage);
+      background: var(--healthy-sage-bg);
+    }
+
+    /* 3. Quiet KPI Number Row */
+    .kpi-row {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 16px;
+      padding: 16px 0;
+      border-top: 1px solid var(--border-color);
+      border-bottom: 1px solid var(--border-color);
+    }
+
+    .kpi-item {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .kpi-label {
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+
+    .kpi-value {
+      font-family: var(--font-mono);
+      font-size: 22px;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    .kpi-value.alert {
+      color: var(--risk-coral);
+    }
+
+    /* 4. Anomaly Banner */
+    .anomaly-banner {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      background: var(--risk-coral-bg);
+      border: 1px solid rgba(217, 100, 58, 0.3);
+      border-radius: 4px;
+      padding: 12px 16px;
+    }
+
+    .anomaly-text {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      color: var(--risk-coral);
+      font-weight: 500;
+    }
+
+    .anomaly-tag {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      text-transform: uppercase;
+      background: var(--risk-coral);
+      color: #fff;
+      padding: 2px 6px;
+      border-radius: 2px;
+    }
+
+    /* 5. Agent Diagnosis Panel (Terminal Glow) */
+    .agent-panel {
+      background: var(--bg-card);
+      border: 1px solid var(--agent-teal-border);
+      box-shadow: 0 0 0 1px rgba(63, 169, 160, 0.08), 0 0 36px var(--agent-teal-glow);
+      border-radius: 6px;
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+      position: relative;
+    }
+
+    .agent-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .agent-title-group {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .agent-avatar {
+      width: 24px;
+      height: 24px;
+      border-radius: 4px;
+      background: var(--agent-teal);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--bg-dark);
+      font-family: var(--font-mono);
+      font-weight: 700;
+      font-size: 12px;
+    }
+
+    .agent-title {
+      font-size: 15px;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    .agent-meta {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--agent-teal);
+    }
+
+    .root-cause-box {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .root-cause-desc {
+      font-size: 14px;
+      color: var(--text-primary);
+      line-height: 1.6;
+    }
+
+    .citation-line {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--text-secondary);
+    }
+
+    .fix-section {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .fix-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    .fix-steps {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .fix-step {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      background: rgba(0, 0, 0, 0.25);
+      padding: 12px;
+      border-radius: 4px;
+      border: 1px solid var(--border-color);
+    }
+
+    .step-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+
+    .sql-code {
+      font-family: var(--font-mono);
+      font-size: 12px;
+      color: #6EE7B7;
+      background: #0D1015;
+      padding: 8px 12px;
+      border-radius: 3px;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+
+    .disclaimer-line {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--text-secondary);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .disclaimer-icon {
+      color: var(--agent-teal);
+    }
+
+    .action-row {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      padding-top: 12px;
+      border-top: 1px solid var(--border-color);
+    }
+
+    .btn-raise {
+      background: var(--agent-teal);
+      color: var(--bg-dark);
+      font-family: var(--font-mono);
+      font-size: 13px;
+      font-weight: 600;
+      border: none;
+      padding: 10px 20px;
+      border-radius: 4px;
+      cursor: pointer;
+      box-shadow: 0 0 16px var(--agent-teal-glow);
+      transition: opacity 0.15s ease, transform 0.1s ease;
+    }
+
+    .btn-raise:hover {
+      opacity: 0.9;
+      transform: translateY(-1px);
+    }
+
+    /* 6. Raised Incident Card */
+    .incident-card {
+      background: var(--bg-card);
+      border: 1px solid var(--risk-coral);
+      border-radius: 6px;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      animation: fadeIn 0.3s ease;
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(6px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    .incident-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .incident-id {
+      font-family: var(--font-mono);
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--risk-coral);
+    }
+
+    .severity-badge {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      font-weight: 600;
+      background: var(--risk-coral);
+      color: #fff;
+      padding: 2px 8px;
+      border-radius: 2px;
+    }
+
+    .incident-meta {
+      font-size: 12px;
+      color: var(--text-secondary);
+      font-family: var(--font-mono);
+    }
+
+    /* 7. Timeline Footer */
+    footer {
+      padding-top: 16px;
+      border-top: 1px solid var(--border-color);
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--text-secondary);
+      display: flex;
+      justify-content: space-between;
+    }
+
+    .timeline-event {
+      color: var(--agent-teal);
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <!-- Header -->
+    <header>
+      <div class="brand">
+        <span class="brand-title">dbpulse</span>
+        <span class="brand-subtitle">Postgres reliability agent</span>
+      </div>
+      <div class="status-badge">
+        <span class="pulse-dot"></span>
+        <span id="poll-timer">last polled 2s ago</span>
+      </div>
+    </header>
+
+    <!-- Fleet Strip -->
+    <div class="fleet-section">
+      <div class="section-label">Database Fleet Status</div>
+      <div class="fleet-list">
+        <div class="fleet-row at-risk">
+          <div class="fleet-info">
+            <span class="status-tick coral"></span>
+            <span class="db-name">PNCPRD01</span>
+            <span class="db-status-desc">Primary cluster · Lock contention detected</span>
+          </div>
+          <span class="risk-score high">RISK 88/100</span>
+        </div>
+        <div class="fleet-row healthy">
+          <div class="fleet-info">
+            <span class="status-tick sage"></span>
+            <span class="db-name">RECON_DB</span>
+            <span class="db-status-desc">Reconciliation service · Healthy</span>
+          </div>
+          <span class="risk-score normal">HEALTHY</span>
+        </div>
+        <div class="fleet-row healthy">
+          <div class="fleet-info">
+            <span class="status-tick sage"></span>
+            <span class="db-name">MBL_STG</span>
+            <span class="db-status-desc">Mobile staging · Healthy</span>
+          </div>
+          <span class="risk-score normal">HEALTHY</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Quiet KPI Number Row -->
+    <div class="kpi-row">
+      <div class="kpi-item">
+        <span class="kpi-label">Active Sessions</span>
+        <span class="kpi-value">42</span>
+      </div>
+      <div class="kpi-item">
+        <span class="kpi-label">Blocked Sessions</span>
+        <span class="kpi-value alert">4</span>
+      </div>
+      <div class="kpi-item">
+        <span class="kpi-label">Cache Hit Ratio</span>
+        <span class="kpi-value">99.4%</span>
+      </div>
+      <div class="kpi-item">
+        <span class="kpi-label">Avg Query Duration</span>
+        <span class="kpi-value alert">840ms</span>
+      </div>
+    </div>
+
+    <!-- Anomaly Banner -->
+    <div class="anomaly-banner">
+      <div class="anomaly-text">
+        <span class="anomaly-tag">ANOMALY DETECTED</span>
+        <span>PNCPRD01: Lock contention on <code>public.orders</code> (PID 48219 holding exclusive tuple lock)</span>
+      </div>
+    </div>
+
+    <!-- Agent Diagnosis Panel -->
+    <div class="agent-panel">
+      <div class="agent-header">
+        <div class="agent-title-group">
+          <div class="agent-avatar">AI</div>
+          <span class="agent-title">Root Cause Diagnosis & Remediation</span>
+        </div>
+        <span class="agent-meta">Model: Claude Sonnet 5 (RAG Grounded)</span>
+      </div>
+
+      <div class="root-cause-box">
+        <p class="root-cause-desc">
+          Session PID 48219 has held an uncommitted row lock on table <code>public.orders</code> for over 180s during a bulk update batch. This block is cascading to 4 subsequent transactions attempting write locks on the same partition.
+        </p>
+        <span class="citation-line">source: pg_stat_activity, pg_locks</span>
+      </div>
+
+      <div class="fix-section">
+        <span class="fix-title">Suggested Remediation Steps:</span>
+        <div class="fix-steps">
+          <div class="fix-step">
+            <div class="step-header">
+              <span>Step 1: Inspect blocking query details</span>
+            </div>
+            <pre class="sql-code">SELECT pid, now() - query_start AS duration, query, state 
+FROM pg_stat_activity WHERE pid = 48219;</pre>
+          </div>
+          <div class="fix-step">
+            <div class="step-header">
+              <span>Step 2: Terminate blocking backend safely</span>
+            </div>
+            <pre class="sql-code">SELECT pg_cancel_backend(48219); -- Attempt graceful cancellation first
+-- If unresponsive: SELECT pg_terminate_backend(48219);</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="disclaimer-line">
+        <span class="disclaimer-icon">🛡</span>
+        <span>generates SQL for a human to run — nothing executes automatically.</span>
+      </div>
+
+      <div class="action-row">
+        <button class="btn-raise" id="btn-raise-incident" onclick="raiseIncident()">Raise Incident Ticket</button>
+      </div>
+    </div>
+
+    <!-- Raised Incident Container -->
+    <div id="incident-container" style="display:none;">
+      <div class="incident-card">
+        <div class="incident-header">
+          <span class="incident-id">INC-00458 — Created</span>
+          <span class="severity-badge">HIGH SEVERITY</span>
+        </div>
+        <div class="incident-meta">
+          Assigned: DBA on-call · Raised by: dbpulse agent · Database: PNCPRD01
+        </div>
+        <p style="font-size: 13px; color: var(--text-primary);">
+          Row lock contention on <code>public.orders</code> (PID 48219). Diagnostic & remediation queries attached to ticket.
+        </p>
+      </div>
+    </div>
+
+    <!-- Timeline Footer -->
+    <footer>
+      <div>System Status: Operational</div>
+      <div>Timeline: <span class="timeline-event" id="timeline-text">14:02 anomaly detected → 14:02 diagnosed by dbpulse</span></div>
+    </footer>
+  </div>
+
+  <script>
+    function raiseIncident() {
+      const container = document.getElementById('incident-container');
+      const btn = document.getElementById('btn-raise-incident');
+      const timeline = document.getElementById('timeline-text');
+
+      container.style.display = 'block';
+      btn.innerText = 'Incident Raised ✓';
+      btn.disabled = true;
+      btn.style.opacity = '0.6';
+      
+      const now = new Date();
+      const timeStr = now.toTimeString().split(' ')[0].substring(0, 5);
+      timeline.innerText = `${timeStr} anomaly detected → ${timeStr} diagnosed → ${timeStr} incident raised INC-00458`;
+    }
+  </script>
+</body>
+</html>
