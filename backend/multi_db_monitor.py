@@ -231,7 +231,7 @@ class MultiDBMonitor:
                 metrics[database] = self._poll_database(database)
             except Exception as error:
                 error_type = type(error).__name__
-                logger.warning("Telemetry failed for %s (%s)", database, error_type)
+                logger.warning("Telemetry failed for %s (%s)", database, error_type, exc_info=True)
                 failures.append(database)
                 metrics[database] = self._demo_metrics(database, error_type)
 
