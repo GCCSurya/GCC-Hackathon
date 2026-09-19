@@ -22,15 +22,17 @@ class MultiDBMonitor:
         self.pgpassword = os.getenv("PGPASSWORD")
         self.pgport = os.getenv("PGPORT", "5432")
         self.pgsslmode = os.getenv("PGSSLMODE", "require")
-        self.active_scenario = "LOCK_CONTENTION"
+        self.simulation_enabled = os.getenv("DBPULSE_ALLOW_DEMO") == "1"
+        self.active_scenario = "HEALTHY"
         self.last_poll_time = time.time()
         self._latest_metrics = {}
         configured = bool(self.pg_url or self.pghost)
         self.connection_status = {
             "state": "unchecked" if configured else "not_configured",
-            "data_source": "demo",
+            "data_source": "demo" if self.simulation_enabled else "unavailable",
+            "simulation_enabled": self.simulation_enabled,
             "checked_at": None,
-            "message": "Connection not checked yet." if configured else "No PostgreSQL configuration in this backend process. Showing demo data.",
+            "message": "Connection not checked yet." if configured else "No PostgreSQL configuration in this backend process.",
             "error_type": None,
         }
 
@@ -54,6 +56,8 @@ class MultiDBMonitor:
         return connection
 
     def set_scenario(self, scenario_name):
+        if not self.simulation_enabled and scenario_name != "HEALTHY":
+            return False
         if scenario_name not in {"LOCK_CONTENTION", "POOL_EXHAUSTION", "RUNAWAY_QUERY", "HEALTHY"}:
             return False
         self.active_scenario = scenario_name
@@ -63,7 +67,7 @@ class MultiDBMonitor:
         return dict(self.connection_status)
 
     def _scenario_anomaly(self, database):
-        if self.active_scenario == "HEALTHY":
+        if not self.simulation_enabled or self.active_scenario == "HEALTHY":
             return None
         if self.active_scenario == "RUNAWAY_QUERY" and database == "gcc_audit_service":
             return {
@@ -89,6 +93,16 @@ class MultiDBMonitor:
         return None
 
     def _demo_metrics(self, database, error_type=None):
+        if not self.simulation_enabled or error_type:
+            return {
+                "status": "UNAVAILABLE", "risk_score": None,
+                "status_desc": f"{self.DATABASES[database]} · Telemetry unavailable",
+                "active_sessions": None, "blocked_sessions": None,
+                "cache_hit_ratio": None, "avg_query_time_ms": None,
+                "connection_utilization_percent": None, "size_bytes": None,
+                "data_source": "unavailable", "error_type": error_type,
+                "anomaly": None,
+            }
         anomaly = self._scenario_anomaly(database)
         return {
             "status": "AT_RISK" if anomaly or error_type else "HEALTHY",
@@ -104,16 +118,63 @@ class MultiDBMonitor:
             "anomaly": anomaly,
         }
 
+    @staticmethod
+    def _live_assessment(database, active, blocked, average_ms, longest_ms, total_connections, max_connections, cache_hit):
+        connection_percent = (total_connections / max_connections * 100) if max_connections else 0
+        risk = min(100, round(
+            min(blocked * 25, 60)
+            + max(connection_percent - 60, 0) * 1.5
+            + max(longest_ms - 30_000, 0) / 3_000
+            + max(95 - cache_hit, 0) * 2
+        ))
+
+        if blocked:
+            anomaly = {
+                "type": "LOCK_CONTENTION", "database": database,
+                "title": f"{blocked} blocked session(s) detected",
+                "target_table": "pg_stat_activity", "blocking_pid": None,
+                "wait_event": "Lock", "waiting_count": blocked,
+                "duration_sec": round(longest_ms / 1000),
+            }
+        elif connection_percent >= 80:
+            anomaly = {
+                "type": "POOL_EXHAUSTION", "database": database,
+                "title": f"Connection capacity is {connection_percent:.0f}% utilized",
+                "target_table": "pg_stat_activity", "blocking_pid": None,
+                "wait_event": "ClientRead", "waiting_count": 0,
+                "duration_sec": round(longest_ms / 1000),
+            }
+        elif longest_ms >= 120_000:
+            anomaly = {
+                "type": "RUNAWAY_QUERY", "database": database,
+                "title": f"Active query running for {longest_ms / 1000:.0f} seconds",
+                "target_table": "pg_stat_activity", "blocking_pid": None,
+                "wait_event": "Active", "waiting_count": 0,
+                "duration_sec": round(longest_ms / 1000),
+            }
+        else:
+            anomaly = None
+
+        return risk, connection_percent, anomaly
+
     def _poll_database(self, database):
         connection = self._connect(database)
         try:
             with connection.cursor() as cursor:
                 cursor.execute("""
                     SELECT count(*) FILTER (WHERE state = 'active'),
-                           count(*) FILTER (WHERE wait_event_type = 'Lock' OR cardinality(pg_blocking_pids(pid)) > 0)
-                    FROM pg_stat_activity WHERE datname = current_database()
+                           count(*) FILTER (WHERE wait_event_type = 'Lock' OR cardinality(pg_blocking_pids(pid)) > 0),
+                           COALESCE(AVG(EXTRACT(EPOCH FROM (clock_timestamp() - query_start)) * 1000)
+                                    FILTER (WHERE state = 'active'), 0),
+                           COALESCE(MAX(EXTRACT(EPOCH FROM (clock_timestamp() - query_start)) * 1000)
+                                    FILTER (WHERE state = 'active'), 0),
+                           (SELECT count(*) FROM pg_stat_activity
+                            WHERE backend_type = 'client backend'),
+                           current_setting('max_connections')::integer
+                    FROM pg_stat_activity
+                    WHERE datname = current_database() AND pid <> pg_backend_pid()
                 """)
-                active, blocked = cursor.fetchone()
+                active, blocked, average_ms, longest_ms, total_connections, max_connections = cursor.fetchone()
                 cursor.execute("""
                     SELECT CASE WHEN blks_hit + blks_read = 0 THEN 100
                                 ELSE blks_hit::float / (blks_hit + blks_read) * 100 END,
@@ -121,22 +182,37 @@ class MultiDBMonitor:
                     FROM pg_stat_database WHERE datname = current_database()
                 """)
                 cache_hit, size_bytes = cursor.fetchone()
+            active = int(active or 0)
+            blocked = int(blocked or 0)
+            average_ms = round(float(average_ms or 0), 1)
+            longest_ms = float(longest_ms or 0)
+            cache_hit = float(cache_hit if cache_hit is not None else 100)
+            risk, connection_percent, live_anomaly = self._live_assessment(
+                database, active, blocked, average_ms, longest_ms,
+                int(total_connections or 0), int(max_connections or 0), cache_hit,
+            )
             simulated = self._scenario_anomaly(database)
-            status = "AT_RISK" if blocked or simulated else "HEALTHY"
-            risk = 88 if blocked or simulated else 10
-            description = "Live lock contention" if blocked else ("Simulated anomaly" if simulated else "Live telemetry healthy")
+            anomaly = live_anomaly or simulated
+            status = "AT_RISK" if anomaly or risk >= 50 else "HEALTHY"
+            if simulated and not live_anomaly:
+                risk = max(risk, 88)
+            description = (
+                f"Live {live_anomaly['type'].replace('_', ' ').lower()}"
+                if live_anomaly else ("Simulated anomaly" if simulated else ("Elevated live risk" if risk >= 50 else "Live telemetry healthy"))
+            )
             return {
                 "status": status,
                 "risk_score": risk,
                 "status_desc": f"{self.DATABASES[database]} · {description}",
-                "active_sessions": active or 0,
-                "blocked_sessions": blocked or 0,
-                "cache_hit_ratio": round(float(cache_hit or 100), 1),
-                "avg_query_time_ms": 0,
+                "active_sessions": active,
+                "blocked_sessions": blocked,
+                "cache_hit_ratio": round(cache_hit, 1),
+                "avg_query_time_ms": average_ms,
+                "connection_utilization_percent": round(connection_percent, 1),
                 "size_bytes": int(size_bytes or 0),
-                "data_source": "live",
+                "data_source": "demo" if simulated and not live_anomaly else "live",
                 "error_type": None,
-                "anomaly": simulated,
+                "anomaly": anomaly,
             }
         finally:
             connection.close()
@@ -162,10 +238,11 @@ class MultiDBMonitor:
         connected = len(self.DATABASES) - len(failures)
         self.connection_status.update(
             state="connected" if not failures else "error",
-            data_source="mixed" if failures else "live",
+            data_source="unavailable" if not connected else ("mixed" if any(item["data_source"] != "live" for item in metrics.values()) else "live"),
             error_type=metrics[failures[0]]["error_type"] if failures else None,
             message=f"Connected to {connected}/{len(self.DATABASES)} configured databases. "
-                    + ("Some fleet entries use demo fallback." if failures else "Fleet health and table metadata are live; anomaly scenarios remain simulated."),
+                    + ("Failed entries have no current risk score." if failures else "PostgreSQL telemetry is available.")
+                    + (" Simulation controls are enabled." if self.simulation_enabled else ""),
         )
         self._latest_metrics = metrics
         return metrics

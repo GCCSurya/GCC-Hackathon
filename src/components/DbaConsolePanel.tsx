@@ -58,7 +58,7 @@ export const DbaConsolePanel: React.FC<DbaConsolePanelProps> = ({
   };
 
   const handleRunSql = () => {
-    setExecutionOutput(`[Query Executed] ${new Date().toLocaleTimeString()} UTC — 1 row affected.\npg_cancel_backend: true (Signal SIGINT sent to backend process).`);
+    setExecutionOutput(`[Preview only] ${new Date().toLocaleTimeString()} UTC - SQL was not sent to PostgreSQL.`);
     setTimeout(() => setExecutionOutput(null), 5000);
   };
 
@@ -70,18 +70,18 @@ export const DbaConsolePanel: React.FC<DbaConsolePanelProps> = ({
           <div className="dba-badge-icon">🛠️</div>
           <div>
             <span className="dba-panel-title">DBA Manual Triage Console</span>
-            <span className="dba-panel-subtitle">Direct SQL Inspection & Manual Remediation Workbench</span>
+            <span className="dba-panel-subtitle">Sample SQL Inspection & Remediation Preview</span>
           </div>
         </div>
         <div className="dba-mode-indicator">
           <span className="manual-pulse"></span>
-          <span>MANUAL CONTROL ACTIVE</span>
+          <span>PREVIEW ONLY</span>
         </div>
       </div>
 
       {/* Interactive Diagnostic Query Selector */}
       <div className="dba-query-selector">
-        <span className="selector-label">Manual Telemetry Queries:</span>
+        <span className="selector-label">Sample Diagnostic Queries:</span>
         <div className="query-btn-group">
           <button
             className={`btn-query-tab ${selectedQueryType === 'locks' ? 'active' : ''}`}
@@ -116,8 +116,8 @@ export const DbaConsolePanel: React.FC<DbaConsolePanelProps> = ({
       {/* Raw Output Inspector Table */}
       <div className="dba-table-container">
         <div className="table-header-label">
-          <span>Live Session Query Output (PNCPRD01)</span>
-          <span className="table-count-badge">{getActiveRows().length} sessions detected</span>
+          <span>Demonstration Session Output</span>
+          <span className="table-count-badge">{getActiveRows().length} sample sessions</span>
         </div>
         <div className="table-scroll-wrapper">
           <table className="dba-raw-table">
@@ -151,7 +151,7 @@ export const DbaConsolePanel: React.FC<DbaConsolePanelProps> = ({
       <div className="dba-workbench-box">
         <div className="workbench-header">
           <span className="workbench-title">Manual Remediation Query Buffer:</span>
-          <span className="workbench-tip">Execute directly or attach to manual incident</span>
+          <span className="workbench-tip">SQL is not sent to PostgreSQL; execution is disabled</span>
         </div>
         <textarea
           className="dba-sql-input"
@@ -162,7 +162,7 @@ export const DbaConsolePanel: React.FC<DbaConsolePanelProps> = ({
         />
         <div className="workbench-actions">
           <button className="btn-dba-execute" onClick={handleRunSql}>
-            ▶ Run Query on PNCPRD01
+            Preview Query
           </button>
           {executionOutput && (
             <span className="dba-exec-output">{executionOutput}</span>
@@ -192,7 +192,7 @@ export const DbaConsolePanel: React.FC<DbaConsolePanelProps> = ({
           className="btn-consult-agent"
           onClick={onConsultAgent}
         >
-          {showAgentSuggestion ? 'Hide AI Suggestion' : '🤖 Ask Agent for Suggestion'}
+          {showAgentSuggestion ? 'Refresh Agent Suggestion' : '🤖 Ask Agent for Suggestion'}
         </button>
 
         <button

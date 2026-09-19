@@ -2,10 +2,44 @@ import unittest
 import json
 import os
 from unittest.mock import MagicMock, patch
+from incident_store import IncidentStore
 from multi_db_monitor import MultiDBMonitor
 from rag_engine import RAGEngine
 from agent import AgentEngine
-from app import app
+from app import app, require_live_database
+
+
+class TestLiveStartup(unittest.TestCase):
+    def test_missing_configuration_stops_before_polling(self):
+        monitor = MagicMock(pg_url=None, pghost=None)
+        with patch("app.db_monitor", monitor):
+            with self.assertRaisesRegex(SystemExit, "start-dbpulse"):
+                require_live_database()
+        monitor.poll_metrics.assert_not_called()
+
+    def test_failed_or_partial_connection_stops_startup(self):
+        for state in ("failed", "partial", "not_configured"):
+            with self.subTest(state=state):
+                monitor = MagicMock(pg_url=None, pghost="example.invalid")
+                monitor.get_connection_status.return_value = {"state": state}
+                with patch("app.db_monitor", monitor):
+                    with self.assertRaisesRegex(SystemExit, "No demo server was started"):
+                        require_live_database()
+                monitor.poll_metrics.assert_called_once()
+
+    def test_connected_fleet_allows_startup(self):
+        monitor = MagicMock(pg_url=None, pghost="example.invalid")
+        monitor.get_connection_status.return_value = {"state": "connected"}
+        with patch("app.db_monitor", monitor), patch("app.incident_store.check_readiness", return_value={"state": "connected"}):
+            require_live_database()
+        monitor.poll_metrics.assert_called_once()
+
+    def test_unready_incident_store_stops_startup(self):
+        monitor = MagicMock(pg_url=None, pghost="example.invalid")
+        monitor.get_connection_status.return_value = {"state": "connected"}
+        with patch("app.db_monitor", monitor), patch("app.incident_store.check_readiness", return_value={"state": "error"}):
+            with self.assertRaisesRegex(SystemExit, "Incident storage startup check failed"):
+                require_live_database()
 
 class TestDBPulseBackend(unittest.TestCase):
     def setUp(self):
@@ -29,7 +63,8 @@ class TestDBPulseBackend(unittest.TestCase):
         self.app.testing = True
 
     def test_db_monitor_scenarios(self):
-        monitor = MultiDBMonitor()
+        with patch.dict(os.environ, {"DBPULSE_ALLOW_DEMO": "1"}):
+            monitor = MultiDBMonitor()
         monitor.set_scenario("LOCK_CONTENTION")
         metrics = monitor.poll_metrics()
         self.assertEqual(set(metrics), set(MultiDBMonitor.DATABASES))
@@ -54,7 +89,8 @@ class TestDBPulseBackend(unittest.TestCase):
         diag = agent.diagnose_anomaly(anomaly, {})
         self.assertIn("root_cause", diag)
         self.assertTrue(len(diag["remediation_steps"]) > 0)
-        self.assertEqual(diag["model"], "dbpulse deterministic RAG fallback")
+        self.assertEqual(diag["model"], "dbpulse rule-based runbook")
+        self.assertTrue(diag["citations"].startswith("Runbook references:"))
 
     def test_azure_responses_api_diagnosis(self):
         model_response = MagicMock()
@@ -62,6 +98,7 @@ class TestDBPulseBackend(unittest.TestCase):
         sdk_client = MagicMock()
         sdk_client.responses.create.return_value = model_response
         environment = {
+            "AGENT_PROVIDER": "azure",
             "AZURE_FOUNDRY_ENDPOINT": "https://example.services.ai.azure.com/openai/v1/responses",
             "AZURE_FOUNDRY_KEY": "test-key",
             "AZURE_FOUNDRY_MODEL": "test-deployment",
@@ -77,7 +114,7 @@ class TestDBPulseBackend(unittest.TestCase):
         self.assertEqual(sdk_client.responses.create.call_args.kwargs["model"], "test-deployment")
 
     def test_azure_status_requires_model_and_key(self):
-        with patch.dict(os.environ, {"AZURE_FOUNDRY_ENDPOINT": "https://example/responses"}, clear=True):
+        with patch.dict(os.environ, {"AGENT_PROVIDER": "azure", "AZURE_FOUNDRY_ENDPOINT": "https://example/responses"}, clear=True):
             status = AgentEngine(RAGEngine()).get_status()
         self.assertFalse(status["configured"])
         self.assertEqual(status["missing"], ["authentication", "model"])
@@ -92,6 +129,7 @@ class TestDBPulseBackend(unittest.TestCase):
             "choices": [{"message": {"content": '{"root_cause":"Live chat analysis","citations":"source: metrics","remediation_steps":[]}'}}]
         }
         environment = {
+            "AGENT_PROVIDER": "azure",
             "AZURE_FOUNDRY_ENDPOINT": "https://example.services.ai.azure.com/openai/v1/responses",
             "AZURE_FOUNDRY_MODEL": "gpt-5.6-sol",
             "AZURE_FOUNDRY_USE_MANAGED_IDENTITY": "true",
@@ -121,6 +159,7 @@ class TestDBPulseBackend(unittest.TestCase):
         sdk_client = MagicMock()
         sdk_client.responses.create.side_effect = sdk_error
         environment = {
+            "AGENT_PROVIDER": "azure",
             "AZURE_FOUNDRY_ENDPOINT": "https://example.services.ai.azure.com/openai/v1/responses",
             "AZURE_FOUNDRY_KEY": "test-key",
             "AZURE_FOUNDRY_MODEL": "gpt-5.6-sol",
@@ -128,7 +167,7 @@ class TestDBPulseBackend(unittest.TestCase):
         with patch.dict(os.environ, environment, clear=True), patch("openai.OpenAI", return_value=sdk_client):
             agent = AgentEngine(RAGEngine())
             diagnosis = agent.diagnose_anomaly({"type": "LOCK_CONTENTION", "title": "test"}, {})
-        self.assertEqual(diagnosis["model"], "dbpulse deterministic RAG fallback")
+        self.assertEqual(diagnosis["model"], "dbpulse rule-based runbook")
         self.assertEqual(
             agent.get_status()["last_error"],
             "Azure OpenAI SDK returned HTTP 401: unsupported_parameter: The input field is unsupported: input",
@@ -146,6 +185,7 @@ class TestDBPulseBackend(unittest.TestCase):
             }]}],
         }
         environment = {
+            "AGENT_PROVIDER": "azure",
             "AZURE_FOUNDRY_ENDPOINT": "https://example.services.ai.azure.com/openai/v1/responses",
             "AZURE_FOUNDRY_MODEL": "gpt-5.6-sol",
             "AZURE_FOUNDRY_USE_MANAGED_IDENTITY": "true",
@@ -176,7 +216,8 @@ class TestDBPulseBackend(unittest.TestCase):
         self.assertEqual(res_agent_status.status_code, 200)
 
         res_diag = self.app.post("/api/diagnose")
-        self.assertEqual(res_diag.status_code, 200)
+        self.assertEqual(res_diag.status_code, 503)
+        self.assertEqual(res_diag.json["error"], "Live fleet telemetry is unavailable")
 
         res_next = self.app.get("/api/next-incident-id")
         self.assertEqual(res_next.status_code, 200)
@@ -200,6 +241,49 @@ class TestDBPulseBackend(unittest.TestCase):
         self.assertEqual(response.status_code, 503)
         self.assertEqual(response.json["error"], "Incident could not be stored")
         self.assertEqual(len(self.incidents), 0)
+
+    def test_reviewed_incident_fields_are_preserved(self):
+        for steps in ([], [{"step": 1, "title": "Reviewed SQL", "sql": "SELECT 42;"}]):
+            with self.subTest(steps=steps), patch("app.agent_engine.diagnose_anomaly") as diagnose:
+                response = self.app.post("/api/raise-incident", json={
+                    "title": "Reviewed incident", "database": "gcc_banking_core",
+                    "root_cause": "", "remediation_steps": steps,
+                })
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json["incident"]["remediation_steps"], steps)
+                self.assertEqual(response.json["incident"]["root_cause"], "")
+                self.assertEqual(self.incident_store.save.call_args.args[0]["remediation_steps"], steps)
+                diagnose.assert_not_called()
+
+    def test_invalid_remediation_is_rejected(self):
+        for steps in (None, "SELECT 1", [{"sql": 123}]):
+            with self.subTest(steps=steps):
+                response = self.app.post("/api/raise-incident", json={"remediation_steps": steps})
+                self.assertEqual(response.status_code, 400)
+        self.incident_store.save.assert_not_called()
+
+    def test_diagnosis_returns_its_snapshot_anomaly(self):
+        anomaly = {"type": "LOCK_CONTENTION", "database": "gcc_reconciliation", "title": "Lock wait"}
+        metrics = {"gcc_reconciliation": {"anomaly": anomaly}}
+        with patch("app.db_monitor.poll_metrics", return_value=metrics) as poll, patch(
+            "app.agent_engine.diagnose_anomaly", return_value={"model": "test"}
+        ) as diagnose:
+            response = self.app.post("/api/diagnose")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["anomaly"], anomaly)
+        poll.assert_called_once()
+        diagnose.assert_called_once_with(anomaly, metrics)
+
+    def test_readiness_requires_fleet_and_storage(self):
+        for fleet_state, storage_state, expected in (
+            ("connected", "connected", 200), ("connected", "error", 503), ("error", "connected", 503),
+        ):
+            with self.subTest(fleet=fleet_state, storage=storage_state), patch(
+                "app.db_monitor.get_connection_status", return_value={"state": fleet_state}
+            ):
+                self.incident_store.check_readiness.return_value = {"state": storage_state}
+                response = self.app.get("/api/readiness")
+                self.assertEqual(response.status_code, expected)
 
 class TestDBConnectivity(unittest.TestCase):
     def setUp(self):
@@ -225,7 +309,7 @@ class TestDBConnectivity(unittest.TestCase):
         monitor = self.configured_monitor()
         connection = MagicMock()
         cursor = connection.cursor.return_value.__enter__.return_value
-        cursor.fetchone.side_effect = [(0, 0), (99.7, 1024)] * 3
+        cursor.fetchone.side_effect = [(0, 0, 0, 0, 12, 100), (99.7, 1024)] * 3
         with patch("psycopg2.connect", return_value=connection) as connect:
             metrics = monitor.poll_metrics()
         self.assertEqual(metrics["gcc_banking_core"]["active_sessions"], 0)
@@ -240,11 +324,45 @@ class TestDBConnectivity(unittest.TestCase):
         self.assertEqual(connection.set_session.call_count, 3)
         self.assertEqual(connection.close.call_count, 3)
 
+    def test_live_blocked_sessions_create_actionable_anomaly(self):
+        monitor = self.configured_monitor()
+        connection = MagicMock()
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.fetchone.side_effect = [(3, 2, 1250, 4000, 24, 100), (98.4, 2048)] * 3
+        with patch("psycopg2.connect", return_value=connection):
+            metrics = monitor.poll_metrics()
+        anomaly = metrics["gcc_banking_core"]["anomaly"]
+        self.assertEqual(anomaly["type"], "LOCK_CONTENTION")
+        self.assertEqual(anomaly["waiting_count"], 2)
+        self.assertEqual(anomaly["database"], "gcc_banking_core")
+        self.assertGreaterEqual(metrics["gcc_banking_core"]["risk_score"], 50)
+
+    def test_live_query_duration_and_connection_pressure_are_data_driven(self):
+        monitor = self.configured_monitor()
+        connection = MagicMock()
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.fetchone.side_effect = [(4, 0, 2375.4, 9000, 30 + 30 + 25, 100), (99.2, 2048)] * 3
+        with patch("psycopg2.connect", return_value=connection):
+            metrics = monitor.poll_metrics()
+        banking = metrics["gcc_banking_core"]
+        self.assertEqual(banking["avg_query_time_ms"], 2375.4)
+        self.assertEqual(banking["connection_utilization_percent"], 85.0)
+        self.assertEqual(banking["anomaly"]["type"], "POOL_EXHAUSTION")
+
+    def test_live_long_running_query_creates_runaway_anomaly(self):
+        monitor = self.configured_monitor()
+        connection = MagicMock()
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.fetchone.side_effect = [(1, 0, 121000, 121000, 15, 100), (99.5, 2048)] * 3
+        with patch("psycopg2.connect", return_value=connection):
+            metrics = monitor.poll_metrics()
+        self.assertEqual(metrics["gcc_banking_core"]["anomaly"]["type"], "RUNAWAY_QUERY")
+
     def test_health_success_requires_real_query_path(self):
         monitor = self.configured_monitor()
         connection = MagicMock()
         cursor = connection.cursor.return_value.__enter__.return_value
-        cursor.fetchone.side_effect = [(2, 0), (99.5, 2048)] * 3
+        cursor.fetchone.side_effect = [(2, 0, 120, 200, 15, 100), (99.5, 2048)] * 3
         with patch("app.db_monitor", monitor), patch("psycopg2.connect", return_value=connection):
             response = self.client.get("/api/db-health")
         self.assertEqual(response.status_code, 200)
@@ -270,14 +388,16 @@ class TestDBConnectivity(unittest.TestCase):
         with patch("psycopg2.connect", return_value=connection):
             metrics = monitor.poll_metrics()
         self.assertIn("gcc_banking_core", metrics)
-        self.assertEqual(monitor.get_connection_status()["data_source"], "mixed")
+        self.assertEqual(monitor.get_connection_status()["data_source"], "unavailable")
+        self.assertIsNone(metrics["gcc_banking_core"]["risk_score"])
+        self.assertIsNone(metrics["gcc_banking_core"]["anomaly"])
         self.assertEqual(connection.close.call_count, 3)
 
     def test_status_recovers_after_failure(self):
         monitor = self.configured_monitor()
         connection = MagicMock()
         cursor = connection.cursor.return_value.__enter__.return_value
-        cursor.fetchone.side_effect = [(1, 0), (99.0, 1024)] * 3
+        cursor.fetchone.side_effect = [(1, 0, 150, 150, 9, 100), (99.0, 1024)] * 3
         with patch("psycopg2.connect", side_effect=[RuntimeError("offline")] * 3 + [connection] * 3):
             monitor.poll_metrics()
             self.assertEqual(monitor.get_connection_status()["state"], "error")
@@ -290,6 +410,29 @@ class TestDBConnectivity(unittest.TestCase):
             response = self.client.get("/api/kpis")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json["connection"]["state"], "not_configured")
+        self.assertIsNone(response.json["kpis"]["active_sessions"])
+
+    def test_live_mode_blocks_scenario_api_and_exposes_mode(self):
+        with patch("app.db_monitor", MultiDBMonitor()):
+            response = self.client.post("/api/trigger-anomaly", json={"scenario": "LOCK_CONTENTION"})
+            fleet = self.client.get("/api/fleet").json
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(fleet["simulation_enabled"])
+        self.assertEqual(fleet["active_scenario"], "HEALTHY")
+
+    def test_unavailable_telemetry_is_not_diagnosed_as_healthy(self):
+        with patch("app.db_monitor", MultiDBMonitor()), patch("app.agent_engine.diagnose_anomaly") as diagnose:
+            response = self.client.post("/api/diagnose")
+        self.assertEqual(response.status_code, 503)
+        diagnose.assert_not_called()
+
+    def test_explicit_demo_mode_allows_scenarios(self):
+        with patch.dict(os.environ, {"DBPULSE_ALLOW_DEMO": "1"}):
+            monitor = MultiDBMonitor()
+        with patch("app.db_monitor", monitor):
+            response = self.client.post("/api/trigger-anomaly", json={"scenario": "LOCK_CONTENTION"})
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json["success"])
 
     def test_unknown_database_and_table_are_rejected(self):
         monitor = self.configured_monitor()
@@ -298,6 +441,20 @@ class TestDBConnectivity(unittest.TestCase):
         with patch("app.db_monitor", monitor):
             response = self.client.get("/api/databases/postgres/tables")
         self.assertEqual(response.status_code, 404)
+
+class TestIncidentStore(unittest.TestCase):
+    def test_random_incident_id_is_checked_for_collision(self):
+        store = IncidentStore()
+        connection = MagicMock()
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.fetchone.side_effect = [(True,), (False,)]
+        with patch.object(store, "_connect", return_value=connection), patch(
+            "incident_store.secrets.token_hex", side_effect=["deadbeef", "1234abcd"]
+        ):
+            incident_id = store.get_next_incident_id()
+        self.assertEqual(incident_id, "INC-1234ABCD")
+        self.assertEqual(cursor.execute.call_count, 2)
+        connection.close.assert_called_once()
 
 if __name__ == "__main__":
     unittest.main()

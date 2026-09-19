@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Header } from './components/Header';
 import { FleetStrip } from './components/FleetStrip';
 import type { FleetItem } from './components/FleetStrip';
@@ -20,71 +20,33 @@ import type { ConnectionStatus } from './components/DatabaseStatus';
 import { DatabaseExplorer } from './components/DatabaseExplorer';
 import './index.css';
 
+const anomalyKey = (value: AnomalyInfo | null) => value
+  ? JSON.stringify([value.database, value.type, value.target_table, value.blocking_pid, value.wait_event])
+  : null;
+const EMPTY_KPIS: KpiData = { active_sessions: null, blocked_sessions: null, cache_hit_ratio: null, avg_query_time_ms: null };
 // Default initial state matching Section 11/12 spec
-const DEFAULT_FLEET: FleetItem[] = [
-  { name: 'gcc_banking_core', status: 'AT_RISK', risk_score: 88, status_desc: 'Banking core · Simulated anomaly' },
-  { name: 'gcc_reconciliation', status: 'HEALTHY', risk_score: 10, status_desc: 'Reconciliation · Awaiting telemetry' },
-  { name: 'gcc_audit_service', status: 'HEALTHY', risk_score: 10, status_desc: 'Audit service · Awaiting telemetry' }
-];
-
-const DEFAULT_KPIS: KpiData = {
-  active_sessions: 42,
-  blocked_sessions: 4,
-  cache_hit_ratio: 99.4,
-  avg_query_time_ms: 840
-};
-
-const DEFAULT_ANOMALY: AnomalyInfo = {
-  type: 'LOCK_CONTENTION',
-  database: 'gcc_banking_core',
-  title: 'Simulated lock contention on public.orders',
-  target_table: 'public.orders',
-  blocking_pid: 48219,
-  wait_event: 'Lock:tuple',
-  waiting_count: 4,
-  duration_sec: 184
-};
-
-const DEFAULT_DIAGNOSIS: DiagnosisData = {
-  model: 'dbpulse deterministic RAG fallback',
-  root_cause: 'Session PID 48219 has held an uncommitted row lock on table public.orders for over 180s during a bulk update batch. This block is cascading to 4 subsequent transactions attempting write locks on the same partition.',
-  citations: 'source: pg_stat_activity, pg_locks',
-  remediation_steps: [
-    {
-      step: 1,
-      title: 'Inspect blocking query details',
-      sql: 'SELECT pid, now() - query_start AS duration, query, state \nFROM pg_stat_activity WHERE pid = 48219;'
-    },
-    {
-      step: 2,
-      title: 'Terminate blocking backend safely',
-      sql: 'SELECT pg_cancel_backend(48219); -- Attempt graceful cancellation first\n-- If unresponsive: SELECT pg_terminate_backend(48219);'
-    }
-  ],
-  disclaimer: 'generates SQL for a human to run — nothing executes automatically.'
-};
 
 export function App() {
   const [appMode, setAppMode] = useState<'agent' | 'dba'>('agent');
   const [showAgentSuggestion, setShowAgentSuggestion] = useState<boolean>(false);
   const [currentView, setCurrentView] = useState<'dashboard' | 'create-incident'>('dashboard');
-  const [fleet, setFleet] = useState<FleetItem[]>(DEFAULT_FLEET);
-  const [kpis, setKpis] = useState<KpiData>(DEFAULT_KPIS);
-  const [anomaly, setAnomaly] = useState<AnomalyInfo | null>(DEFAULT_ANOMALY);
-  const [diagnosis, setDiagnosis] = useState<DiagnosisData | null>(DEFAULT_DIAGNOSIS);
+  const [fleet, setFleet] = useState<FleetItem[]>([]);
+  const [kpis, setKpis] = useState<KpiData>(EMPTY_KPIS);
+  const [anomaly, setAnomaly] = useState<AnomalyInfo | null>(null);
+  const [diagnosis, setDiagnosis] = useState<DiagnosisData | null>(null);
   const [incident, setIncident] = useState<IncidentData | null>(null);
-  const [timeline, setTimeline] = useState<TimelineEntry[]>([
-    { timestamp: '14:00:00', event: 'Fleet monitoring initialized', type: 'system' },
-    { timestamp: '14:02:15', event: 'gcc_banking_core: Simulated anomaly selected (Lock Contention)', type: 'anomaly' },
-    { timestamp: '14:02:18', event: 'gcc_banking_core diagnosed by dbpulse (deterministic RAG fallback)', type: 'diagnosis' }
-  ]);
+  const [timeline, setTimeline] = useState<TimelineEntry[]>([]);
   const [lastPolledSecAgo, setLastPolledSecAgo] = useState(2);
-  const [activeScenario, setActiveScenario] = useState('LOCK_CONTENTION');
+  const [activeScenario, setActiveScenario] = useState('HEALTHY');
+  const [simulationEnabled, setSimulationEnabled] = useState(false);
   const [isDiagnosing, setIsDiagnosing] = useState(false);
   const [connection, setConnection] = useState<ConnectionStatus>({
-    state: 'checking', message: 'Waiting for a backend telemetry check. Initial dashboard values are demo data.',
+    state: 'checking', message: 'Waiting for a backend telemetry check.',
   });
   const [selectedDatabase, setSelectedDatabase] = useState('gcc_banking_core');
+  const lastDiagnosedAnomaly = useRef<string | null>(null);
+  const requestGeneration = useRef(0);
+  const [refreshVersion, setRefreshVersion] = useState(0);
 
   // Hash-based back/forward routing support
   useEffect(() => {
@@ -113,13 +75,18 @@ export function App() {
   useEffect(() => {
     let stopped = false;
     let timer: ReturnType<typeof setTimeout>;
+    const generation = ++requestGeneration.current;
+    const isCurrent = () => !stopped && generation === requestGeneration.current;
     const fetchData = async () => {
       try {
         const fleetRes = await fetch('/api/fleet', { signal: AbortSignal.timeout(15000) });
         if (!fleetRes.ok) throw new Error('Fleet request failed');
         if (fleetRes.ok) {
           const fleetData = await fleetRes.json();
+          if (!isCurrent()) return;
           setFleet(fleetData.fleet);
+          setSimulationEnabled(fleetData.simulation_enabled === true);
+          setActiveScenario(fleetData.active_scenario ?? 'HEALTHY');
           setLastPolledSecAgo(fleetData.last_polled_sec_ago || 1);
         }
 
@@ -127,6 +94,7 @@ export function App() {
         if (!kpiRes.ok) throw new Error('KPI request failed');
         if (kpiRes.ok) {
           const kpiData = await kpiRes.json();
+          if (!isCurrent()) return;
           setKpis(kpiData.kpis);
           setConnection(kpiData.connection ?? {
             state: 'unknown', message: 'This backend does not report database status. Restart it with the updated code.',
@@ -134,129 +102,99 @@ export function App() {
         }
 
         const anomalyRes = await fetch('/api/anomaly', { signal: AbortSignal.timeout(15000) });
+        if (!anomalyRes.ok) throw new Error('Anomaly request failed');
         if (anomalyRes.ok) {
           const anomalyData = await anomalyRes.json();
-          setAnomaly(anomalyData.anomaly);
+          if (!isCurrent()) return;
+          const nextAnomaly = anomalyData.anomaly as AnomalyInfo | null;
+          setAnomaly(nextAnomaly);
+          if (lastDiagnosedAnomaly.current !== anomalyKey(nextAnomaly)) {
+            setDiagnosis(null);
+            lastDiagnosedAnomaly.current = null;
+          }
+          if (!nextAnomaly) {
+            lastDiagnosedAnomaly.current = null;
+            setDiagnosis(null);
+          } else if ((appMode === 'agent' || showAgentSuggestion) && lastDiagnosedAnomaly.current !== anomalyKey(nextAnomaly)) {
+            setDiagnosis(null);
+            setIsDiagnosing(true);
+            try {
+              const diagnosisRes = await fetch('/api/diagnose', { method: 'POST', signal: AbortSignal.timeout(30000) });
+              if (!diagnosisRes.ok) throw new Error('Diagnosis request failed');
+              if (diagnosisRes.ok) {
+                const diagnosisData = await diagnosisRes.json();
+                if (!isCurrent() || anomalyKey(diagnosisData.anomaly) !== anomalyKey(nextAnomaly)) return;
+                setDiagnosis(diagnosisData.diagnosis);
+                lastDiagnosedAnomaly.current = anomalyKey(nextAnomaly);
+              }
+            } finally {
+              if (isCurrent()) setIsDiagnosing(false);
+            }
+          }
         }
 
         const timelineRes = await fetch('/api/timeline', { signal: AbortSignal.timeout(15000) });
         if (timelineRes.ok) {
           const timelineData = await timelineRes.json();
+          if (!isCurrent()) return;
           setTimeline(timelineData.timeline);
         }
       } catch {
+        if (!isCurrent()) return;
+        setAnomaly(null);
+        setKpis(EMPTY_KPIS);
+        setFleet(previous => previous.map(database => ({
+          ...database, status: 'UNAVAILABLE', risk_score: null,
+          data_source: 'unavailable', status_desc: 'Telemetry unavailable',
+        })));
+        setDiagnosis(null);
+        lastDiagnosedAnomaly.current = null;
         setConnection({ state: 'unavailable', message: 'Could not complete the backend poll. Live database connectivity is not confirmed.' });
         // Increment timer if running standalone
         setLastPolledSecAgo(prev => (prev >= 5 ? 1 : prev + 1));
       } finally {
         // Avoid piling up database requests when a connection is slow or unavailable.
-        if (!stopped) timer = setTimeout(fetchData, 3000);
+        if (isCurrent()) timer = setTimeout(fetchData, 3000);
       }
     };
 
     fetchData();
     return () => { stopped = true; clearTimeout(timer); };
-  }, [selectedDatabase]);
+  }, [selectedDatabase, appMode, showAgentSuggestion, refreshVersion]);
 
   // Handle Scenario Switch
-  const handleSelectScenario = async (scenario: string) => {
-    setActiveScenario(scenario);
-    setIncident(null);
-    setIsDiagnosing(true);
-
-    try {
-      await fetch('/api/trigger-anomaly', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ scenario })
-      });
-
-      const diagRes = await fetch('/api/diagnose', { method: 'POST' });
-      if (diagRes.ok) {
-        const diagData = await diagRes.json();
-        setDiagnosis(diagData.diagnosis);
-      }
-    } catch {
-      // Local fallback for static preview
-      if (scenario === 'LOCK_CONTENTION') {
-        setFleet(DEFAULT_FLEET);
-        setKpis(DEFAULT_KPIS);
-        setAnomaly(DEFAULT_ANOMALY);
-        setDiagnosis(DEFAULT_DIAGNOSIS);
-      } else if (scenario === 'POOL_EXHAUSTION') {
-        setFleet([
-          { name: 'gcc_banking_core', status: 'AT_RISK', risk_score: 92, status_desc: 'Banking core · Simulated connection pool exhaustion' },
-          { name: 'gcc_reconciliation', status: 'HEALTHY', risk_score: 10, status_desc: 'Reconciliation · Demo healthy' },
-          { name: 'gcc_audit_service', status: 'HEALTHY', risk_score: 10, status_desc: 'Audit service · Demo healthy' }
-        ]);
-        setKpis({ active_sessions: 98, blocked_sessions: 24, cache_hit_ratio: 96.2, avg_query_time_ms: 1420 });
-        setAnomaly({
-          type: 'POOL_EXHAUSTION',
-          database: 'gcc_banking_core',
-          title: 'Max connections reached (98/100 active connections in ClientRead wait)',
-          target_table: 'global_pool'
-        });
-        setDiagnosis({
-          model: 'dbpulse deterministic RAG fallback',
-          root_cause: 'A simulated connection pool exhaustion scenario was selected for gcc_banking_core.',
-          citations: 'source: pg_stat_activity, pg_stat_database',
-          remediation_steps: [
-            { step: 1, title: 'Inspect idle connections', sql: "SELECT pid, state, now() - state_change FROM pg_stat_activity WHERE state = 'idle in transaction';" },
-            { step: 2, title: 'Terminate stale connections (>5m)', sql: "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE state = 'idle in transaction' AND now() - state_change > interval '5 minutes';" }
-          ],
-          disclaimer: 'generates SQL for a human to run — nothing executes automatically.'
-        });
-      } else if (scenario === 'RUNAWAY_QUERY') {
-        setFleet([
-          { name: 'gcc_banking_core', status: 'HEALTHY', risk_score: 10, status_desc: 'Banking core · Demo healthy' },
-          { name: 'gcc_reconciliation', status: 'HEALTHY', risk_score: 10, status_desc: 'Reconciliation · Demo healthy' },
-          { name: 'gcc_audit_service', status: 'AT_RISK', risk_score: 78, status_desc: 'Audit service · Simulated sequential scan' }
-        ]);
-        setKpis({ active_sessions: 31, blocked_sessions: 0, cache_hit_ratio: 84.1, avg_query_time_ms: 2100 });
-        setAnomaly({
-          type: 'RUNAWAY_QUERY',
-          database: 'gcc_audit_service',
-          title: 'Simulated runaway scan on public.audit_logs',
-          target_table: 'public.audit_logs'
-        });
-        setDiagnosis({
-          model: 'dbpulse deterministic RAG fallback',
-          root_cause: 'Runaway query PID 31092 scanning 42M rows sequentially on public.audit_logs due to missing predicate index.',
-          citations: 'source: pg_stat_activity, DataFileRead wait events',
-          remediation_steps: [
-            { step: 1, title: 'Cancel runaway query', sql: 'SELECT pg_cancel_backend(31092);' },
-            { step: 2, title: 'Create missing index', sql: 'CREATE INDEX CONCURRENTLY idx_audit_logs_payload ON public.audit_logs(payload); ANALYZE public.audit_logs;' }
-          ],
-          disclaimer: 'generates SQL for a human to run — nothing executes automatically.'
-        });
-      }
-    } finally {
-      setIsDiagnosing(false);
-    }
+  const invalidateDiagnosis = () => {
+    requestGeneration.current += 1;
+    lastDiagnosedAnomaly.current = null;
+    setDiagnosis(null);
+    setIsDiagnosing(false);
   };
 
-  const handleReset = async () => {
-    setActiveScenario('HEALTHY');
+  const handleSelectScenario = async (scenario: string) => {
+    invalidateDiagnosis();
     setIncident(null);
-    setIsDiagnosing(false);
-
     try {
-      await fetch('/api/reset', { method: 'POST' });
+      const response = await fetch(scenario === 'HEALTHY' ? '/api/reset' : '/api/trigger-anomaly', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scenario }),
+        signal: AbortSignal.timeout(15000),
+      });
+      if (!response.ok) throw new Error('Scenario request failed');
+      const data = await response.json();
+      if (!data.success) throw new Error('Scenario rejected');
+      setActiveScenario(data.active_scenario);
     } catch {
-      // Local fallback
+      setConnection({ state: 'unavailable', message: 'Scenario change failed. Refreshing backend status.' });
+    } finally {
+      setRefreshVersion(previous => previous + 1);
     }
-
-    setFleet([
-      { name: 'gcc_banking_core', status: 'HEALTHY', risk_score: 10, status_desc: 'Banking core · Healthy' },
-      { name: 'gcc_reconciliation', status: 'HEALTHY', risk_score: 10, status_desc: 'Reconciliation · Healthy' },
-      { name: 'gcc_audit_service', status: 'HEALTHY', risk_score: 10, status_desc: 'Audit service · Healthy' }
-    ]);
-    setKpis({ active_sessions: 12, blocked_sessions: 0, cache_hit_ratio: 99.8, avg_query_time_ms: 14 });
-    setAnomaly(null);
-    setDiagnosis(null);
   };
 
   const handleToggleMode = (mode: 'agent' | 'dba') => {
+    invalidateDiagnosis();
+    setShowAgentSuggestion(false);
+    setRefreshVersion(previous => previous + 1);
     setAppMode(mode);
     const nowTime = new Date().toTimeString().split(' ')[0].substring(0, 5);
     setTimeline(prev => [
@@ -321,17 +259,21 @@ export function App() {
               anomaly={anomaly}
               diagnosis={diagnosis}
               onCreateIncident={() => handleNavigate('create-incident')}
-              onConsultAgent={() => setShowAgentSuggestion(prev => !prev)}
+              onConsultAgent={() => {
+                invalidateDiagnosis();
+                setShowAgentSuggestion(true);
+                setRefreshVersion(previous => previous + 1);
+              }}
               showAgentSuggestion={showAgentSuggestion}
             />
           )}
 
           <IncidentCard incident={incident} />
-          <DemoControls
+          {simulationEnabled && <DemoControls
             activeScenario={activeScenario}
             onSelectScenario={handleSelectScenario}
-            onReset={handleReset}
-          />
+            onReset={() => handleSelectScenario('HEALTHY')}
+          />}
         </>
       )}
 

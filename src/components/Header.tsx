@@ -29,7 +29,7 @@ export const Header: React.FC<HeaderProps> = ({
             type="button"
             className={`mode-pill-btn ${appMode === 'agent' ? 'active-agent' : ''}`}
             onClick={() => onToggleMode('agent')}
-            title="Agent Mode: Autonomous monitoring, RAG diagnosis & auto-remediation"
+            title="Agent Mode: Anomaly monitoring, runbook guidance and reviewable SQL"
           >
             <span className="mode-icon">🤖</span>
             <span>Agent Mode</span>

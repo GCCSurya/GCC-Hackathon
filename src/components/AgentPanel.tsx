@@ -41,7 +41,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
         <div className="agent-header">
           <div className="agent-title-group">
             <div className="agent-avatar">AI</div>
-            <span className="agent-title">Analyzing Telemetry & RAG Knowledge Base...</span>
+            <span className="agent-title">Reviewing Anomaly & Runbooks...</span>
           </div>
         </div>
         <p className="root-cause-desc">Querying pg_stat_activity & matching wait-event patterns...</p>

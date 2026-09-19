@@ -1,17 +1,8 @@
 export interface ConnectionStatus {
   state: 'checking' | 'unchecked' | 'connected' | 'not_configured' | 'error' | 'unavailable' | 'unknown';
   message: string;
+  simulation_enabled?: boolean;
 }
-
-const LABELS: Record<ConnectionStatus['state'], string> = {
-  checking: 'Checking database status',
-  unchecked: 'Database not checked yet',
-  connected: 'PostgreSQL connected · Mixed live/demo data',
-  not_configured: 'Demo data · Database not configured',
-  error: 'Demo fallback · Database check failed',
-  unavailable: 'Backend unavailable · Data may be stale or demo',
-  unknown: 'Database status unknown · Restart updated backend',
-};
 
 export function DatabaseStatus({ connection }: { connection: ConnectionStatus }) {
   return (
@@ -23,8 +14,10 @@ export function DatabaseStatus({ connection }: { connection: ConnectionStatus })
       background: 'var(--dba-amber-bg)',
       fontSize: 13,
     }}>
-      <strong style={{ color: 'var(--dba-amber)' }}>{LABELS[connection.state]}</strong>
-      <div style={{ color: 'var(--text-secondary)', marginTop: 4 }}>{connection.message}</div>
+      <strong style={{ color: 'var(--dba-amber)' }}>{connection.message}</strong>
+      {connection.simulation_enabled && (
+        <div style={{ color: 'var(--text-secondary)', marginTop: 4 }}>Simulation enabled</div>
+      )}
     </div>
   );
 }

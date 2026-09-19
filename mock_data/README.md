@@ -92,8 +92,9 @@ replacement strategy; do not drop it just to rerun the seed.
 Next, restart the updated backend in its credential-configured terminal and
 check `/api/db-health`. A 200 response with `connection.state=connected`
 confirms monitoring queries work. Importing rows does not generate active
-sessions or lock contention, and the dashboard still mixes live and demo
-metrics. Existing scenario SQL and remediation suggestions reference
+sessions or lock contention. Dashboard risk is based on live PostgreSQL telemetry
+by default; synthetic scenarios require explicit `DBPULSE_ALLOW_DEMO=1` opt-in.
+Existing scenario SQL and remediation suggestions reference
 `public.orders` or `public.audit_logs`; do not execute them against the shared
 database. Any later workload must explicitly target `dbpulse_demo` and be
 bounded and separately approved.
@@ -160,15 +161,15 @@ The script will:
 
 ---
 
-### 4. Connect the `dbpulse` Backend to `testdb`
+### 4. Connect the `dbpulse` Backend to the Fleet
 
-In your backend `.env` or terminal before launching Flask:
+In your terminal before launching Flask:
 ```bash
-export POSTGRES_URL="postgresql://postgres:<your-password>@localhost:5432/testdb"
+export POSTGRES_URL="postgresql://postgres:<your-password>@localhost:5432/gcc_banking_core"
 python backend/app.py
 ```
 
-`db_monitor.py` will automatically detect `POSTGRES_URL` and query live metrics from `pg_stat_activity` and `pg_stat_database`!
+[MultiDBMonitor](../backend/multi_db_monitor.py) reads `POSTGRES_URL` and queries live metrics from `pg_stat_activity` and `pg_stat_database` using read-only connections. It connects separately to `gcc_banking_core`, `gcc_reconciliation`, and `gcc_audit_service`, overriding the database name in the URL. All three databases must exist and be accessible; importing the standalone `testdb` dataset above does not configure the monitored fleet.
 
 ---
 

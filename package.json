@@ -4,9 +4,11 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
+    "start": "powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File ./start-dbpulse.ps1",
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
+    "demo:agent": "node scripts/run-agent-demo.mjs",
     "preview": "vite preview"
   },
   "dependencies": {
@@ -22,6 +24,7 @@
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.3",
     "oxlint": "^1.71.0",
+    "playwright": "^1.63.0",
     "typescript": "~6.0.2",
     "vite": "^8.1.1"
   }

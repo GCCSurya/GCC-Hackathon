@@ -1,4 +1,5 @@
 import React from 'react';
+import type { RemediationStep } from './AgentPanel';
 
 export interface IncidentData {
   incident_id: string;
@@ -9,6 +10,7 @@ export interface IncidentData {
   raised_by: string;
   created_at: string;
   root_cause?: string;
+  remediation_steps?: RemediationStep[];
 }
 
 interface IncidentCardProps {

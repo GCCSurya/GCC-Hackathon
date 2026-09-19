@@ -21,70 +21,56 @@ export const CreateIncidentPage: React.FC<CreateIncidentPageProps> = ({
   onCancel,
   onIncidentCreated
 }) => {
-  const [incidentId, setIncidentId] = useState<string>('INC-00459');
-  const [title, setTitle] = useState<string>('');
-  const [database, setDatabase] = useState<string>('gcc_banking_core');
+  const [incidentId, setIncidentId] = useState<string>('Assigned on submission');
+  const [title, setTitle] = useState<string>(() => anomaly?.title || 'Database Performance Anomaly - Requires DBA Inspection');
+  const [database, setDatabase] = useState<string>(() => anomaly?.database || 'gcc_banking_core');
   const [severity, setSeverity] = useState<string>('HIGH');
   const [category, setCategory] = useState<string>('Database - PostgreSQL Fleet');
   const [assignedTo, setAssignedTo] = useState<string>('DBA Operations / Reliability Engineering');
-  const [rootCause, setRootCause] = useState<string>('');
-  const [remediationSql, setRemediationSql] = useState<string>('');
-  const [notes, setNotes] = useState<string>('');
+  const [rootCause, setRootCause] = useState<string>(() => diagnosis?.root_cause || '');
+  const [remediationSql, setRemediationSql] = useState<string>(() =>
+    diagnosis?.remediation_steps.map(step => `-- Step ${step.step}: ${step.title}\n${step.sql}`).join('\n\n') || '');
+  const [notes, setNotes] = useState<string>(() => appMode === 'dba' ? 'Manual incident dispatch logged via DBA Console.' : '');
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
+  const [submitError, setSubmitError] = useState<string>('');
   const [submittedIncident, setSubmittedIncident] = useState<IncidentData | null>(null);
   const [copied, setCopied] = useState<boolean>(false);
 
-  // Initialize fields from anomaly & diagnosis
   useEffect(() => {
-    // Fetch upcoming incident ID
+    let cancelled = false;
     fetch('/api/next-incident-id')
       .then(res => res.json())
       .then(data => {
-        if (data.next_incident_id) {
+        if (!cancelled && data.next_incident_id) {
           setIncidentId(data.next_incident_id);
         }
       })
       .catch(() => {
-        setIncidentId(`INC-00${Math.floor(Math.random() * 800) + 460}`);
+        if (!cancelled) setIncidentId('Assigned on submission');
       });
-
-    if (anomaly) {
-      setTitle(anomaly.title || `Performance Anomaly on ${anomaly.database}`);
-      setDatabase(anomaly.database || 'gcc_banking_core');
-    } else {
-      setTitle('Database Performance Anomaly — Requires DBA Inspection');
-    }
-
-    if (diagnosis) {
-      setRootCause(diagnosis.root_cause || '');
-      const sqlBlocks = diagnosis.remediation_steps
-        ? diagnosis.remediation_steps.map(s => `-- Step ${s.step}: ${s.title}\n${s.sql}`).join('\n\n')
-        : '';
-      setRemediationSql(sqlBlocks);
-    }
-
-    if (appMode === 'dba') {
-      setNotes('Manual incident dispatch logged via DBA Console.');
-    }
-  }, [anomaly, diagnosis, appMode]);
+    return () => { cancelled = true; };
+  }, []);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setIsSubmitting(true);
+    setSubmitError('');
 
     const nowTime = new Date().toTimeString().split(' ')[0].substring(0, 5);
 
     const payload = {
-      incident_id: incidentId,
+      ...(incidentId.startsWith('INC-') ? { incident_id: incidentId } : {}),
       severity,
       title: title || 'PostgreSQL Fleet Anomaly',
       database,
       category,
       assigned_to: assignedTo,
-      raised_by: 'dbpulse AI Agent',
+      raised_by: appMode === 'dba' ? 'Human DBA Operations' : 'dbpulse AI Agent',
       created_at: nowTime,
       root_cause: rootCause,
-      remediation_steps: diagnosis?.remediation_steps || [],
+      remediation_steps: remediationSql.trim()
+        ? [{ step: 1, title: 'Reviewed remediation SQL', sql: remediationSql }]
+        : [],
       notes
     };
 
@@ -102,24 +88,13 @@ export const CreateIncidentPage: React.FC<CreateIncidentPageProps> = ({
         onIncidentCreated(finalInc);
         return;
       }
+      const data = await res.json().catch(() => ({}));
+      setSubmitError(data.error || 'Incident could not be stored.');
     } catch {
-      // Standalone client fallback
+      setSubmitError('Incident could not be stored because the backend is unavailable.');
+    } finally {
+      setIsSubmitting(false);
     }
-
-    const fallbackInc: IncidentData = {
-      incident_id: incidentId,
-      severity,
-      title: title || 'PostgreSQL Fleet Anomaly',
-      database,
-      assigned_to: assignedTo,
-      raised_by: 'dbpulse AI Agent',
-      created_at: nowTime,
-      root_cause: rootCause
-    };
-
-    setSubmittedIncident(fallbackInc);
-    onIncidentCreated(fallbackInc);
-    setIsSubmitting(false);
   };
 
   const handleCopyId = () => {
@@ -136,9 +111,9 @@ export const CreateIncidentPage: React.FC<CreateIncidentPageProps> = ({
       <div className="incident-create-container">
         <div className="incident-success-card">
           <div className="success-icon-badge">🛡️</div>
-          <h2 className="success-title">Incident Successfully Dispatched</h2>
+          <h2 className="success-title">Incident Successfully Stored</h2>
           <p className="success-subtitle">
-            The incident record has been registered with ServiceNow / Enterprise Monitoring and assigned to the reliability on-call team.
+            The incident record was persisted to the PostgreSQL incident store at test.public.incidents.
           </p>
 
           <div className="incident-receipt-box">
@@ -171,7 +146,9 @@ export const CreateIncidentPage: React.FC<CreateIncidentPageProps> = ({
             </div>
             <div className="receipt-row">
               <span className="receipt-label">Remediation SQL:</span>
-              <span className="receipt-val highlight">Attached automatically (2 steps)</span>
+              <span className="receipt-val highlight">
+                {submittedIncident.remediation_steps?.length || 0} step(s) stored with the incident
+              </span>
             </div>
           </div>
 
@@ -205,6 +182,7 @@ export const CreateIncidentPage: React.FC<CreateIncidentPageProps> = ({
       </div>
 
       <form onSubmit={handleSubmit} className="incident-form-grid">
+        {submitError && <div className="form-error" role="alert">{submitError}</div>}
         {/* Left Column: Core Fields */}
         <div className="form-card main-form">
           <div className="form-section-title">
@@ -311,7 +289,7 @@ export const CreateIncidentPage: React.FC<CreateIncidentPageProps> = ({
           </div>
 
           <div className="form-field">
-            <label>RAG Root Cause Diagnosis</label>
+            <label>Suggested Root Cause</label>
             <textarea
               className="form-textarea readonly-box"
               rows={4}
@@ -340,7 +318,7 @@ export const CreateIncidentPage: React.FC<CreateIncidentPageProps> = ({
 
           <div className="reporter-stamp">
             <span>Reporter: <strong>{appMode === 'dba' ? 'Human DBA Operations (Manual Mode)' : 'dbpulse AI Reliability Agent'}</strong></span>
-            <span>Grounding: <strong>PostgreSQL Wait-Events Knowledge Base</strong></span>
+            <span>Guidance: <strong>PostgreSQL Wait-Event Runbooks</strong></span>
           </div>
         </div>
       </form>

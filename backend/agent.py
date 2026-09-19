@@ -6,26 +6,26 @@ logger = logging.getLogger("agent")
 
 FALLBACK_DIAGNOSES = {
     "LOCK_CONTENTION": {
-        "model": "dbpulse deterministic RAG fallback",
-        "root_cause": "Session PID 48219 has held an uncommitted row lock on table public.orders for over 180 seconds during a bulk update operation. This block is cascading to 4 subsequent transactions attempting write locks on the same tuple.",
+        "model": "dbpulse rule-based runbook",
+        "root_cause": "PostgreSQL reports one or more sessions waiting on locks held by other backends. Inspect the current blocking chain before choosing whether to cancel a query or resolve the owning transaction.",
         "citations": "source: pg_stat_activity, pg_locks",
         "remediation_steps": [
             {
                 "step": 1,
                 "title": "Inspect blocking query details and duration",
-                "sql": "SELECT pid, now() - query_start AS duration, query, state \nFROM pg_stat_activity WHERE pid = 48219;"
+                "sql": "SELECT pid, pg_blocking_pids(pid) AS blocked_by, now() - query_start AS duration, query, state\nFROM pg_stat_activity\nWHERE cardinality(pg_blocking_pids(pid)) > 0;"
             },
             {
                 "step": 2,
-                "title": "Cancel blocking backend safely",
-                "sql": "SELECT pg_cancel_backend(48219); -- Attempt graceful cancellation\n-- If process remains active: SELECT pg_terminate_backend(48219);"
+                "title": "Review the blocker before remediation",
+                "sql": "SELECT DISTINCT blocker.pid, blocker.usename, blocker.state, blocker.query\nFROM pg_stat_activity waiting\nCROSS JOIN LATERAL unnest(pg_blocking_pids(waiting.pid)) AS blocker_pid\nJOIN pg_stat_activity blocker ON blocker.pid = blocker_pid;"
             }
         ],
         "disclaimer": "generates SQL for a human to run — nothing executes automatically."
     },
     "POOL_EXHAUSTION": {
-        "model": "dbpulse deterministic RAG fallback",
-        "root_cause": "Active connection count reached 98/100 on gcc_banking_core. Application microservices are leaking idle-in-transaction sessions, causing incoming client requests to wait on ClientRead events.",
+        "model": "dbpulse rule-based runbook",
+        "root_cause": "Observed connections have crossed the configured capacity threshold. Inspect connection state and client ownership to distinguish active demand from stale or idle-in-transaction sessions.",
         "citations": "source: pg_stat_activity, pg_stat_database",
         "remediation_steps": [
             {
@@ -42,19 +42,19 @@ FALLBACK_DIAGNOSES = {
         "disclaimer": "generates SQL for a human to run — nothing executes automatically."
     },
     "RUNAWAY_QUERY": {
-        "model": "dbpulse deterministic RAG fallback",
-        "root_cause": "Runaway query PID 31092 executing full sequential table scan across 42 Million rows on public.audit_logs due to missing predicate index on payload column.",
+        "model": "dbpulse rule-based runbook",
+        "root_cause": "PostgreSQL reports an active query beyond the configured runtime threshold. Inspect its execution plan, wait event, and workload owner before cancellation or index changes.",
         "citations": "source: pg_stat_activity, DataFileRead wait events",
         "remediation_steps": [
             {
                 "step": 1,
-                "title": "Cancel runaway sequential scan query",
-                "sql": "SELECT pg_cancel_backend(31092);"
+                "title": "Inspect longest-running active queries",
+                "sql": "SELECT pid, now() - query_start AS runtime, wait_event_type, wait_event, query\nFROM pg_stat_activity\nWHERE state = 'active' AND pid <> pg_backend_pid()\nORDER BY query_start;"
             },
             {
                 "step": 2,
-                "title": "Create recommended index concurrently",
-                "sql": "CREATE INDEX CONCURRENTLY idx_audit_logs_payload \nON public.audit_logs(payload);\nANALYZE public.audit_logs;"
+                "title": "Capture the plan before changing schema",
+                "sql": "-- Run EXPLAIN (ANALYZE, BUFFERS) only after reviewing the selected read query and its production impact."
             }
         ],
         "disclaimer": "generates SQL for a human to run — nothing executes automatically."
@@ -64,6 +64,7 @@ FALLBACK_DIAGNOSES = {
 class AgentEngine:
     def __init__(self, rag_engine):
         self.rag_engine = rag_engine
+        self.provider = os.getenv("AGENT_PROVIDER", "deterministic").lower()
         self.anthropic_key = os.getenv("ANTHROPIC_API_KEY")
         self.openai_key = os.getenv("OPENAI_API_KEY")
         self.azure_foundry_endpoint = os.getenv("AZURE_FOUNDRY_ENDPOINT") or os.getenv("AZURE_OPENAI_ENDPOINT")
@@ -73,6 +74,15 @@ class AgentEngine:
         self.last_provider_error = None
 
     def get_status(self):
+        if self.provider == "deterministic":
+            return {
+                "provider": "deterministic rules",
+                "configured": True,
+                "model": "dbpulse rule-based runbook",
+                "authentication": "none",
+                "missing": [],
+                "last_error": self.last_provider_error,
+            }
         if self.azure_foundry_endpoint:
             missing = []
             if not self.azure_foundry_key and not self.azure_use_managed_identity:
@@ -238,7 +248,7 @@ class AgentEngine:
         )
         
         # Attempt LLM API call if key configured
-        if self.anthropic_key or self.openai_key or self.get_status()["configured"]:
+        if self.provider != "deterministic" and (self.anthropic_key or self.openai_key or self.get_status()["configured"]):
             try:
                 import requests
                 # 1. Azure AI Foundry / Azure OpenAI Endpoint
@@ -297,4 +307,5 @@ class AgentEngine:
 
         # Guaranteed high-quality fallback
         diagnosis = FALLBACK_DIAGNOSES.get(anomaly_type, FALLBACK_DIAGNOSES["LOCK_CONTENTION"]).copy()
+        diagnosis["citations"] = diagnosis["citations"].replace("source:", "Runbook references:")
         return diagnosis
