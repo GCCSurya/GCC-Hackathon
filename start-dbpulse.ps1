@@ -26,7 +26,7 @@ if (-not $ResetCredentials -and (Test-Path $profilePath)) {
     }
 }
 $defaults = @{
-    PGHOST = "10.15.2.14"
+    PGHOST = "ilb-3790team39postgres.postgres.database.azure.com"
     PGPORT = "5432"
     PGUSER = "team39admin"
     PGSSLMODE = "require"

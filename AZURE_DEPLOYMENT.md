@@ -1,305 +1,268 @@
-# Deploy This dbpulse Application to Azure
+# Deploy dbpulse to an Existing Azure Web App
 
-**Scope:** Your Linux Azure Web App and Azure PostgreSQL server already exist. This guide only configures and deploys this application to those resources. It does not create Azure resources, create databases, seed data, or change application code.
+This guide deploys the current application to an **existing Linux App Service Web App (Code publishing, Python runtime)** and connects it to your **existing Azure PostgreSQL server and databases**. It does not create Azure resources, databases, tables, or seed data. Windows-hosted and custom-container Web Apps require a different deployment workflow.
 
-React is built locally and uploaded with the Flask backend. Azure installs the Python dependencies, and Gunicorn serves the UI and API from the same HTTPS address.
+React is built locally into `dist`. Azure installs the Python dependencies, and Gunicorn serves the dashboard and API from the same HTTPS origin. No Vite server, separate frontend hosting, or API URL configuration is needed.
 
-Use **Windows PowerShell 5.1 and Azure CLI**. Run the steps in order, stop if a command fails, and use the same terminal session so variables remain available.
+## 1. Confirm Prerequisites and Select the Target
 
-### Configuration taken from this application
-
-These non-secret values come from [start-dbpulse.ps1](start-dbpulse.ps1), [backend/multi_db_monitor.py](backend/multi_db_monitor.py), and [backend/incident_store.py](backend/incident_store.py). They are repository defaults, not a live verification of your Azure resources. Confirm they are still the intended targets before applying them.
-
-| Component | This application's value |
-| --- | --- |
-| PostgreSQL server | `ilb-3790team39postgres.postgres.database.azure.com` |
-| Current database login | `team39admin` |
-| Fleet databases | `gcc_banking_core`, `gcc_reconciliation`, `gcc_audit_service` |
-| Incident storage | `test.public.incidents` |
-| Foundry endpoint | `https://ilb-3790-team39aifoundry.services.ai.azure.com/openai/v1/responses` |
-| Foundry model deployment | `gpt-5.6-sol` |
-| Flask entry point | `app:app`, run from the backend directory |
-| Frontend build | `npm.cmd run build`, producing the `dist` directory |
-| Azure startup | `bash startup.sh` |
-| Application health route | `/healthz` |
-
-The subscription ID, Web App name, and Web App resource group are not recorded in this repository. Step 1 asks for only those identifiers; passwords and API keys are entered separately and privately in the Azure portal. This procedure does not create or seed anything in the existing PostgreSQL server.
-
-## 1. Select the existing Web App
-
-You need a recent [Azure CLI](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli-windows), Node.js 22.12+ on the 22.x line (or another Vite-compatible version), npm, and permission to deploy to the existing Web App.
+Use Windows PowerShell 5.1 from the repository root, with Azure CLI, Node.js 20.19+ or 22.12+ (or a newer Vite-compatible release), and npm installed. Keep the same terminal open for all steps. Stop on any error.
 
 ```powershell
-Set-Location (Join-Path $env:USERPROFILE "Documents\Main code\GCC-Hackathon")
+$ErrorActionPreference = "Stop"
+if (-not (Test-Path .\startup.sh)) { throw "Open a terminal in the repository root first." }
 az version
 node --version
 npm.cmd --version
 az login
+if ($LASTEXITCODE -ne 0) { throw "Azure login failed." }
 az account list --query "[].{Subscription:name,Id:id}" --output table
-$subscriptionId = Read-Host "Subscription ID containing your existing dbpulse Web App"
+$subscriptionId = Read-Host "Subscription ID containing the existing Web App"
 az account set --subscription $subscriptionId
 if ($LASTEXITCODE -ne 0) { throw "Subscription selection failed." }
 az webapp list --query "[].{WebApp:name,ResourceGroup:resourceGroup,Kind:kind}" --output table
-$resourceGroup = Read-Host "Existing Web App resource group from the list above"
-$appName = Read-Host "Existing Web App name from the list above"
+$resourceGroup = Read-Host "Existing Web App resource group"
+$appName = Read-Host "Existing Web App name"
 az webapp show --resource-group $resourceGroup --name $appName --query "{name:name,host:defaultHostName,state:state,kind:kind}" --output table
-if ($LASTEXITCODE -ne 0) { throw "Web App lookup failed. Check the selected subscription and names." }
+if ($LASTEXITCODE -ne 0) { throw "Web App lookup failed." }
+az webapp config show --resource-group $resourceGroup --name $appName --query "{runtime:linuxFxVersion,startup:appCommandLine,alwaysOn:alwaysOn}" --output table
+if ($LASTEXITCODE -ne 0) { throw "Runtime lookup failed." }
 ```
 
-Confirm that the returned Web App is the intended deployment target. Deployment replaces the application on that target and restarts it; retain the previous deployment package if rollback is needed. Do not paste passwords, keys, or publish profiles into chat, source files, or command arguments.
+Confirm the selected target before proceeding: deployment replaces its application and restarts it. Retain the previous known-good deployment package and configuration for rollback. These commands target the main site, not a deployment slot; use your existing slot/release process if required.
 
-In the portal, verify that the existing Web App uses **Code publishing with a Python runtime on Linux**. Linux alone is not sufficient: a custom-container Web App needs a different deployment workflow. Under **Settings > Configuration / Stack settings**, select a supported Python version, such as **Python 3.12**, if not already configured. This package does not use Node.js as the server runtime.
+In the Azure portal, confirm **Settings > Configuration > Stack settings** uses a supported Python runtime, such as Python 3.12, on Linux. This application does not use the Node.js server stack.
 
-Keep the existing approved authentication, HTTPS, and network restrictions. The app has no built-in authentication and exposes database previews and incident APIs, so access must be restricted before connecting real data. Your deployment machine must also be allowed to reach the SCM/deployment endpoint.
+The application has **no built-in authentication**. Preserve or configure approved App Service Authentication, HTTPS-only access, and network restrictions before exposing real data. Your deployment machine must also be allowed to reach the SCM/deployment endpoint. Do not disable these protections to make deployment or smoke tests pass.
 
-## 2. Configure startup and application settings
+## 2. Check Existing Database Access
 
-In the Web App's **Settings > Configuration > Stack settings**, set **Startup Command** to:
+The current backend expects the following on the same PostgreSQL server:
 
-```text
-bash startup.sh
+| Purpose | Required existing database/object |
+| --- | --- |
+| Fleet monitoring | `gcc_banking_core`, `gcc_reconciliation`, `gcc_audit_service` |
+| Incident persistence | `public.incidents` in `INCIDENT_DATABASE` (default: `test`) |
+
+The three fleet names are defined in [backend/multi_db_monitor.py](backend/multi_db_monitor.py); setting `PGDATABASE` or changing the database name in a connection URL does not rename this fleet. Incident connections use `INCIDENT_DATABASE` even when a connection URL is supplied.
+
+Confirm with the database owner:
+
+- The app login can connect to all three fleet databases and read the PostgreSQL monitoring views needed for telemetry. Use an approved monitoring role with sufficient visibility, not a superuser solely for convenience.
+- Table browsing requires access to the relevant public tables. Monitoring access alone does not grant permission to preview business data.
+- Incident storage has compatible columns, types, required defaults, schema access, `INSERT` privileges for inserted columns, `SELECT` for incident-ID lookup, and any required sequence privileges. See [backend/incident_store.py](backend/incident_store.py) and [mock_data/seed_incident_store.sql](mock_data/seed_incident_store.sql) as schema references only. Do not rerun seed scripts against the existing database.
+- The **Web App itself** can reach the database over TCP 5432. A working pgAdmin connection on your laptop does not prove this.
+
+For a private PostgreSQL endpoint, verify existing Web App VNet integration, routing, and private DNS resolution. For public access, verify approved database firewall rules include the app's applicable outbound IP addresses. Inspect them with:
+
+```powershell
+az webapp show --resource-group $resourceGroup --name $appName --query "{current:outboundIpAddresses,possible:possibleOutboundIpAddresses}" --output json
+if ($LASTEXITCODE -ne 0) { throw "Outbound address lookup failed." }
 ```
 
-For this repository, that script checks for the built frontend and starts the equivalent of the following command when `WEB_CONCURRENCY=1` and `PORT` is unset:
+Do not open PostgreSQL to all IP addresses as a workaround. Resolve missing databases, schema, permissions, or network access with the existing resource owners; this deployment does not provision them.
+
+## 3. Configure the Web App
+
+### Startup and Non-Secret Settings
+
+The current [startup.sh](startup.sh) checks for `dist/index.html` and runs:
 
 ```bash
-gunicorn --chdir backend --bind 0.0.0.0:8000 --workers 1 --timeout 120 --access-logfile - --error-logfile - app:app
+gunicorn --chdir backend --bind "0.0.0.0:${PORT:-8000}" --workers 1 --timeout 120 --access-logfile - --error-logfile - app:app
 ```
 
-Do not use the local PowerShell launcher on Azure Linux: it expects a Windows virtual environment and interactive password prompts. Do not use `python backend/app.py` as the Azure startup command; that starts Flask's development server.
+Use **`bash startup.sh`** as the Startup Command. Do not use `npm start`, the Windows credential launcher, or Flask's development server on Azure.
 
-Apply the startup command and **this application's non-secret settings** with Azure CLI. This overwrites settings of the same name on the selected Web App, so first confirm the targets in the table above:
+Enter your actual existing database host and approved login below. Use the server's fully qualified hostname from Azure, not a hostname copied from an old deployment guide. Values in [start-dbpulse.ps1](start-dbpulse.ps1) are local defaults and are not transferred to Azure.
+
+Before applying this configuration, inspect App settings in the portal for `POSTGRES_URL` or `DATABASE_URL`. The backend chooses `POSTGRES_URL` first, then `DATABASE_URL`, ahead of the `PG*` settings. For the `PG*` workflow below, remove only stale URL settings after confirming that switch is intended. If retaining an approved URL configuration, omit the `PGHOST`, `PGPORT`, `PGUSER`, and `PGSSLMODE` entries below and manage the URL privately, including its TLS options.
 
 ```powershell
-$resourceGroup = "ILB-3790RG-Team39"
-$appName = "ilb3790team39python"
-az webapp config set --name $appName --resource-group $resourceGroup --startup-file "bash startup.sh" --output none
+$pgHost = Read-Host "Existing PostgreSQL server FQDN"
+$pgUser = Read-Host "Approved PostgreSQL app login"
+$incidentDatabase = Read-Host "Existing incident database name (usually test)"
+if ([string]::IsNullOrWhiteSpace($pgHost) -or [string]::IsNullOrWhiteSpace($pgUser) -or [string]::IsNullOrWhiteSpace($incidentDatabase)) {
+    throw "Host, login, and incident database are required."
+}
+az webapp config set --resource-group $resourceGroup --name $appName --startup-file "bash startup.sh" --output none
 if ($LASTEXITCODE -ne 0) { throw "Startup configuration failed." }
-$dbpulseSettings = @(
+$settings = @(
     "SCM_DO_BUILD_DURING_DEPLOYMENT=true"
-    "WEB_CONCURRENCY=1"
-    "PGHOST=ilb-3790team39postgres.postgres.database.azure.com"
+    "AGENT_PROVIDER=deterministic"
+    "DBPULSE_ALLOW_DEMO=0"
+    "PGHOST=$pgHost"
     "PGPORT=5432"
-    "PGUSER=team39admin"
+    "PGUSER=$pgUser"
     "PGSSLMODE=require"
-    "INCIDENT_DATABASE=test"
-    "AZURE_FOUNDRY_ENDPOINT=https://ilb-3790-team39aifoundry.services.ai.azure.com/openai/v1/responses"
-    "AZURE_FOUNDRY_MODEL=gpt-5.6-sol"
-    "AZURE_FOUNDRY_USE_MANAGED_IDENTITY=false"
+    "INCIDENT_DATABASE=$incidentDatabase"
 )
-az webapp config appsettings set --name $appName --resource-group $resourceGroup --settings $dbpulseSettings --output none
-if ($LASTEXITCODE -ne 0) { throw "dbpulse settings update failed." }
-az webapp log config --name $appName --resource-group $resourceGroup --docker-container-logging filesystem --output none
+az webapp config appsettings set --resource-group $resourceGroup --name $appName --settings $settings --output none
+if ($LASTEXITCODE -ne 0) { throw "Application settings update failed." }
+az webapp log config --resource-group $resourceGroup --name $appName --docker-container-logging filesystem --output none
+if ($LASTEXITCODE -ne 0) { throw "Log configuration failed." }
 ```
 
-In **Settings > Environment variables > App settings**, set or confirm the following. Enter the database password privately in the portal, or retain your existing resolved Key Vault reference.
+These commands overwrite settings of the same name. The baseline intentionally selects deterministic guidance and disables simulation. If you need an existing Foundry integration, apply the optional provider settings below afterward. Preserve stricter approved TLS configuration if your environment already uses it.
 
-| Name | Value |
+### Secrets and Platform Settings
+
+In **Settings > Environment variables > App settings** (portal labels may vary):
+
+- Add `PGPASSWORD` privately for the selected login, or retain an existing resolved Key Vault reference. Never put passwords, API keys, publish profiles, or secret connection URLs in source files, ZIPs, command arguments, or chat.
+- Use **App settings**, not the separate Connection strings section. The code reads these exact environment variable names and does not automatically load an environment file.
+- The encrypted Windows profile used by [start-dbpulse.ps1](start-dbpulse.ps1) cannot be used on Azure Linux. Do not upload it or the local virtual environment.
+- Remove `WEBSITE_RUN_FROM_PACKAGE` if present when using this remote-build ZIP workflow. Review conflicting custom build commands with the app owner. Azure must install Python dependencies from the root [requirements.txt](requirements.txt), which includes [backend/requirements.txt](backend/requirements.txt).
+- Leave `PORT` unset unless your platform configuration explicitly requires it; the script defaults to port 8000. `WEBSITES_PORT` is not needed for the built-in Python stack.
+
+Save/apply settings. Configuration changes restart the application.
+
+### Worker, Scaling, and Monitoring Limits
+
+[startup.sh](startup.sh) **hard-codes one Gunicorn worker**; `WEB_CONCURRENCY` does not change it. Use one Web App instance for consistent in-memory timeline and scenario state. Coordinate any scale-out changes with the app owner; do not change a shared App Service plan blindly. Restarts clear in-memory state, but persisted PostgreSQL incidents remain.
+
+Enable **Always On** if supported by the existing tier. It keeps the web process available but **does not start the background monitor**. Unlike the Windows launcher, Azure's current startup script does not run [backend/monitor_worker.py](backend/monitor_worker.py) or [backend/run_dashboard.py](backend/run_dashboard.py). Dashboard/API requests drive telemetry polling. Continuous monitoring without browser/API traffic requires a separately managed worker deployment, outside this web-only procedure.
+
+For App Service **Health check**, `/healthz` is a cheap liveness endpoint. Use `/api/readiness` as the deployment acceptance check for actual database readiness. Choosing readiness as the platform health-check path also couples instance health to database outages and runs database queries on each probe; coordinate that choice and authentication behavior with the app owner.
+
+### Optional Azure AI Foundry
+
+The default `AGENT_PROVIDER=deterministic` uses fixed rule-based runbook guidance. It needs **no AI endpoint, API key, or managed identity**, and is not an LLM or retrieval-generated answer.
+
+To use an existing, approved Azure AI Foundry model deployment, configure:
+
+| App setting | Value |
 | --- | --- |
-| `SCM_DO_BUILD_DURING_DEPLOYMENT` | `true`, so Azure installs Python dependencies |
-| `WEB_CONCURRENCY` | `1`, because demo state is held in process memory |
-| `PGHOST` | `ilb-3790team39postgres.postgres.database.azure.com` |
-| `PGPORT` | `5432` |
-| `PGUSER` | `team39admin`, the login used by the repository's launcher |
-| `PGPASSWORD` | The password for that login, entered privately, or its existing Key Vault reference |
-| `PGSSLMODE` | `require` |
-| `INCIDENT_DATABASE` | `test` |
+| `AGENT_PROVIDER` | `azure` (required to leave deterministic mode) |
+| `AZURE_FOUNDRY_ENDPOINT` | Your existing model endpoint, for example `https://<resource>.services.ai.azure.com/openai/v1/responses` |
+| `AZURE_FOUNDRY_MODEL` | Your actual model deployment name |
+| `AZURE_FOUNDRY_KEY` | API key entered privately or an existing resolved Key Vault reference |
+| `AZURE_FOUNDRY_USE_MANAGED_IDENTITY` | `false` for this App Service workflow |
 
-The command deliberately does not set passwords or keys. In the portal, add `PGPASSWORD` for the login above and `AZURE_FOUNDRY_KEY` for the Foundry resource below, then select **Apply**. Retain existing valid secret values or resolved references rather than replacing them unnecessarily. Do not paste a JSON export of all settings into chat: it can contain secrets.
+The current identity code in [backend/agent.py](backend/agent.py) calls the Azure VM metadata endpoint, not App Service's identity endpoint. Do not select managed-identity inference on App Service without updating that implementation. App Service Key Vault references are separate and can still use the Web App identity.
 
-`team39admin` is the checked-in launcher default, not a least-privilege recommendation. If your DBA has already provided a dedicated app login or stricter TLS settings, substitute those approved values in the settings array before running it.
+Confirm endpoint networking and authorization, and approve sending diagnosis context to the model. Inference failures fall back to deterministic guidance. `/api/agent-status` reports configuration and the last provider error, not proof of a successful model call. Verify an actual diagnosis and its returned model label when cloud inference is required.
 
-Use **App settings**, not the separate Connection strings blade: the code reads these exact variable names. Local terminal settings and [start-dbpulse.ps1](start-dbpulse.ps1) are not automatically transferred to Azure, and the backend does not automatically load an environment file.
+## 4. Build and Package Locally
 
-Before applying the settings array, check for `POSTGRES_URL` or `DATABASE_URL` in the portal. Those URLs override the `PG*` values. If retaining an approved URL-based configuration, omit the five `PG*` entries from the array. Otherwise remove only stale URL settings when intentionally switching to the concrete `PG*` configuration above.
-
-For this remote-build method, remove `WEBSITE_RUN_FROM_PACKAGE` if set. Review any old pre/post-build commands and remove only those that conflict with this deployment. Do not set up a Vite server or frontend port. The existing [startup.sh](startup.sh) binds to `${PORT:-8000}`; no custom `PORT` or `WEBSITES_PORT` is normally needed for the built-in Python stack.
-
-Use one App Service instance as well as one worker for consistent scenario/timeline state. If the current app scales out, coordinate this constraint with its owner rather than changing a shared plan blindly. Enable Always On if the existing tier supports it. Optionally configure **Monitoring > Health check** with `/healthz`.
-
-Save/apply the settings. Configuration changes restart the app.
-
-## 3. Check access to the existing database
-
-No database creation or seed scripts are required by this deployment procedure. Confirm the existing database environment meets the application's requirements:
-
-- Fleet monitoring expects `gcc_banking_core`, `gcc_reconciliation`, and `gcc_audit_service` on the configured server. Setting `PGDATABASE` does not change these names.
-- The incident database selected by `INCIDENT_DATABASE` must contain `public.incidents` with the schema expected by the app. The schema definition is in [mock_data/seed_incident_store.sql](mock_data/seed_incident_store.sql), for reference only; do not rerun it against an initialized database.
-- The existing login needs connection and monitoring access to all three fleet databases, read access to public tables for table browsing, and `SELECT`/`INSERT` access to the incident table. Fleet and incident connections share the configured server/login.
-- The Web App, not just your laptop or pgAdmin, must have network access to PostgreSQL. For public access, confirm approved firewall rules cover the app's outbound addresses. For private access, confirm existing VNet integration, routing, and private DNS allow TCP 5432.
-
-Find outbound addresses in the Web App's **Properties**, or run:
+Run from the repository root. If a lockfile exists, use it; otherwise install dependencies to generate one before building:
 
 ```powershell
-az webapp show --name $appName --resource-group $resourceGroup --query "{current:outboundIpAddresses,possible:possibleOutboundIpAddresses}" --output json
-```
-
-Do not open PostgreSQL to all IPs as a workaround. If database names, schema, permissions, or connectivity differ, resolve that prerequisite with the database owner. A successful deployment cannot fix those mismatches; the dashboard may show demo fallback and incident requests may return HTTP 503.
-
-### This application's Foundry settings
-
-The settings command uses the endpoint and model selected by the local launcher. Confirm this existing deployment is accessible from the Web App, and add its API key privately in App settings:
-
-| Name | Value |
-| --- | --- |
-| `AZURE_FOUNDRY_ENDPOINT` | `https://ilb-3790-team39aifoundry.services.ai.azure.com/openai/v1/responses` |
-| `AZURE_FOUNDRY_MODEL` | `gpt-5.6-sol` |
-| `AZURE_FOUNDRY_KEY` | Existing API key entered privately, or a resolved Key Vault reference |
-| `AZURE_FOUNDRY_USE_MANAGED_IDENTITY` | `false` for the current code on App Service |
-
-The agent's current managed-identity implementation targets Azure VMs and does not work unchanged on App Service, which is why this guide deliberately differs from the local launcher's default. Existing Key Vault references are independent of that limitation. If no valid key is configured or inference fails, the app uses deterministic RAG fallback; a deployed dashboard is not proof that the model is working. No AI or Key Vault resource creation is included in this guide.
-
-## 4. Build and package the application locally
-
-Run from the project root, not from the backend directory:
-
-```powershell
-npm.cmd ci
+if (Test-Path .\package-lock.json) {
+    npm.cmd ci
+} else {
+    npm.cmd install
+}
 if ($LASTEXITCODE -ne 0) { throw "Frontend dependency installation failed." }
 npm.cmd run build
 if ($LASTEXITCODE -ne 0) { throw "Frontend build failed." }
 ```
 
-The frontend build must produce an index page and assets in the generated `dist` directory. No separate API base URL is needed: the deployed UI uses the same origin as Flask.
-
-Before packaging, open [startup.sh](startup.sh) in VS Code and confirm the status bar shows **LF**, not CRLF. If necessary, select the line-ending indicator, choose LF, and save. Bash can fail on Windows CRLF line endings; `bash startup.sh` avoids needing an executable permission bit but does not fix line endings.
-
-Create a temporary staging folder outside the repository and save the finished ZIP in the project root. Copy only the runtime files; do not upload the Windows virtual environment, Node dependencies, Git history, credentials, data exports, or presentations. Keep generated deployment ZIPs out of source control.
-
-Paste the following as **one command in PowerShell**, from the repository root after the frontend build succeeds. Semicolons separate the commands; visual wrapping in the editor is fine. It stops on errors and prints the ZIP path when complete. Each run replaces `dbpulse-deploy.zip` in the project root; retain a separate known-good copy before packaging if rollback is needed. Keep this terminal open so `$zipPath` is available for archive inspection.
+Create the deployment archive as `dbpulse-deploy.zip` in the repository root. The temporary staging directory contains only the built UI, Python runtime files, and dependency/startup files. The command normalizes the **staged copy** of the shell script to LF, leaving the source unchanged, and writes Linux-compatible ZIP entry separators.
 
 ```powershell
-$stage = Join-Path (Get-Item $env:TEMP -ErrorAction Stop).FullName ("dbpulse-stage-" + [guid]::NewGuid().ToString("N")); $zipPath = Join-Path (Get-Location).Path "dbpulse-deploy.zip"; New-Item -ItemType Directory -Path $stage -ErrorAction Stop | Out-Null; New-Item -ItemType Directory -Path (Join-Path $stage "backend") -ErrorAction Stop | Out-Null; Copy-Item -Path ".\dist" -Destination $stage -Recurse -ErrorAction Stop; Copy-Item -Path ".\requirements.txt", ".\startup.sh" -Destination $stage -ErrorAction Stop; Get-ChildItem -Path ".\backend" -File -ErrorAction Stop | Where-Object { $_.Extension -eq ".py" -or $_.Name -eq "requirements.txt" } | Copy-Item -Destination (Join-Path $stage "backend") -ErrorAction Stop; Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem; $stream = [System.IO.File]::Open($zipPath, [System.IO.FileMode]::Create); try { $archive = [System.IO.Compression.ZipArchive]::new($stream, [System.IO.Compression.ZipArchiveMode]::Create); try { Get-ChildItem -Path $stage -File -Recurse -ErrorAction Stop | ForEach-Object { $entryName = $_.FullName.Substring($stage.Length + 1).Replace('\', '/'); [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, $_.FullName, $entryName) | Out-Null } } finally { $archive.Dispose() } } finally { $stream.Dispose() }; Write-Output "Deployment ZIP: $zipPath"
-```
-
-This explicitly writes `/` separators in ZIP entry names for Azure Linux. Windows PowerShell 5.1 `Compress-Archive` can write backslashes, causing Linux to miss files such as `backend/requirements.txt` even when they appear present in a Windows archive viewer.
-
-The ZIP must contain these entries at its root, with **no extra enclosing project or staging directory**:
-
-```text
-requirements.txt
-startup.sh
-backend/
-    app.py
-    agent.py
-    multi_db_monitor.py
-    incident_store.py
-    rag_engine.py
-    ...other Python files...
-    requirements.txt
-dist/
-    index.html
-    assets/
-```
-
-Inspect the archive and fail early if key files are missing:
-
-```powershell
-Add-Type -AssemblyName System.IO.Compression.FileSystem
+$stage = Join-Path $env:TEMP ("dbpulse-stage-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path (Join-Path $stage "backend") -Force | Out-Null
+$stage = (Get-Item $stage).FullName
+$zipPath = Join-Path (Get-Location).Path "dbpulse-deploy.zip"
+Copy-Item -Path .\dist -Destination $stage -Recurse
+Copy-Item -Path .\requirements.txt -Destination $stage
+Get-ChildItem .\backend -File |
+    Where-Object { ($_.Extension -eq ".py" -and $_.Name -notlike "test_*") -or $_.Name -eq "requirements.txt" } |
+    Copy-Item -Destination (Join-Path $stage "backend")
+$startupSource = (Resolve-Path .\startup.sh).Path
+$startupText = [System.IO.File]::ReadAllText($startupSource).Replace("`r`n", "`n")
+[System.IO.File]::WriteAllText((Join-Path $stage "startup.sh"), $startupText, [System.Text.UTF8Encoding]::new($false))
+Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+$archive = [System.IO.Compression.ZipFile]::Open($zipPath, [System.IO.Compression.ZipArchiveMode]::Create)
+try {
+    Get-ChildItem $stage -File -Recurse | ForEach-Object {
+        $entryName = $_.FullName.Substring($stage.Length + 1).Replace('\', '/')
+        [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, $_.FullName, $entryName) | Out-Null
+    }
+} finally {
+    $archive.Dispose()
+}
 $archive = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
 try {
     $entries = @($archive.Entries | ForEach-Object { $_.FullName })
-    if (@($entries | Where-Object { $_.Contains('\') }).Count) { throw "ZIP contains Windows path separators. Recreate it using the packaging command above." }
-    foreach ($required in @("requirements.txt", "startup.sh", "backend/app.py", "backend/requirements.txt", "dist/index.html")) {
+    if (@($entries | Where-Object { $_.Contains('\') }).Count) { throw "ZIP contains Windows separators." }
+    foreach ($required in @("requirements.txt", "startup.sh", "backend/requirements.txt", "backend/app.py", "backend/agent.py", "backend/incident_store.py", "backend/multi_db_monitor.py", "backend/rag_engine.py", "dist/index.html")) {
         if ($required -notin $entries) { throw "Missing ZIP entry: $required" }
     }
     $entries
 } finally {
     $archive.Dispose()
 }
+Write-Output "Deployment ZIP: $zipPath"
 ```
 
-The package deliberately excludes the Node package manifest: React is already built, so Azure only needs to detect and build Python. The root [requirements.txt](requirements.txt) includes [backend/requirements.txt](backend/requirements.txt); both must be packaged. Do not deploy the Windows Python environment because Azure installs Linux dependencies.
+The archive must have `requirements.txt`, `startup.sh`, `backend/`, and `dist/` directly at its root, **without an enclosing project folder**. Do not ZIP the whole repository. The Node manifest is deliberately omitted so remote build detects Python; the frontend is already compiled. Local credentials, `.venv`, `node_modules`, `.git`, mock data, and environment files must not be included.
 
-## 5. Deploy the ZIP
+## 5. Deploy to the Selected Web App
 
-Run from the project root in PowerShell:
+This publishes to the target selected in step 1. Do not reassign those variables to names copied from an earlier guide.
 
 ```powershell
-$resourceGroup = "ILB-3790RG-Team39"
-$appName = "ilb3790team39python"
-az webapp deploy --resource-group $resourceGroup --name $appName --src-path "dbpulse-deploy.zip" --type zip --output none
-if ($LASTEXITCODE -ne 0) { throw "Azure deployment failed; inspect Deployment Center logs." }
+az webapp deploy --resource-group $resourceGroup --name $appName --src-path $zipPath --type zip --output none
+if ($LASTEXITCODE -ne 0) { throw "Deployment failed. Check Deployment Center logs." }
 $appHost = az webapp show --resource-group $resourceGroup --name $appName --query defaultHostName --output tsv
+if ($LASTEXITCODE -ne 0) { throw "Web App hostname lookup failed." }
 $baseUrl = "https://$appHost"
-Write-Output $baseUrl
+Write-Output "Open $baseUrl"
 ```
 
-Use Azure's returned hostname rather than constructing it: some Web Apps use a generated hostname suffix. Deployment restarts the app. Allow the remote build and startup to finish before verifying it.
+Use the returned hostname rather than constructing it. In the portal, check **Deployment Center > Logs** for successful remote Python dependency installation, then **Monitoring > Log stream** for Gunicorn startup. An uploaded ZIP alone does not prove a healthy deployment.
 
-In the portal, check **Deployment Center > Logs** for dependency installation and deployment success. Check **Monitoring > Log stream** for Gunicorn startup and Python errors. A successful file upload alone is not proof that the application started.
+If SCM access fails, verify network restrictions and your signed-in identity's deployment permissions. Use a current Azure CLI and the approved Microsoft Entra deployment flow; do not broadly enable publishing passwords or expose SCM as a workaround.
 
-If deployment cannot reach the SCM endpoint, check your network restrictions and the signed-in user's deployment permissions. Use a current Azure CLI with Microsoft Entra authentication; do not broadly enable publishing passwords or expose the SCM endpoint to bypass policy.
+## 6. Verify Before Accepting the Deployment
 
-## 6. Verify the deployment
-
-Open `$baseUrl` in a browser and sign in with an approved account. In that same authenticated browser session, open the routes below:
+Open `$baseUrl` and sign in through the approved authentication mechanism. Check the following in that authenticated browser session:
 
 | Route/action | Expected result |
 | --- | --- |
-| `/` | dbpulse dashboard, styles, and interactive controls load |
-| `/healthz` | HTTP 200 JSON with `status: ok` |
-| `/api/fleet` | JSON fleet response; not proof of live database connectivity |
-| `/api/db-health` | HTTP 200 only when all three fleet checks succeed; 503 is expected in demo mode or on connection/query failure |
-| `/api/agent-status` | Provider/model configuration; `configured: true` alone does not prove a successful inference request |
-| `/api/next-incident-id` | Next incident ID when incident storage is configured; HTTP 503 otherwise |
-| Agent/DBA mode switch | Both views render correctly |
-| Simulated anomaly control | Scenario updates and diagnosis appears; a live AI deployment must show a live model label rather than deterministic fallback |
-| Table explorer | Fleet table inventory and previews load if database setup/permissions succeeded |
-| Create Incident | On an approved test database, submit a clearly labeled deployment-test incident and verify its row in `public.incidents` |
+| `/` | Dashboard, styles, and assets load; Agent and DBA views work |
+| `/healthz` | HTTP 200, `{"status":"ok"}`; proves only web-process liveness |
+| `/api/readiness` | HTTP 200, `success: true`, `connection.state: connected`, and `incident_storage.state: connected` |
+| `/api/db-health` | HTTP 200 with connected fleet telemetry; 503 on unavailable fleet reads |
+| `/api/fleet` | Three databases with live telemetry; HTTP 200 alone is not a readiness guarantee |
+| `/api/agent-status` | Default provider is `deterministic rules`, or the explicitly configured cloud provider |
+| `/api/next-incident-id` | An ID formatted as `INC-` plus eight hexadecimal characters; does not insert an incident |
+| Table explorer | Inventory and approved table previews load for the selected fleet database |
 
-Test incident submission creates a real database row. Do not run it against production without approval. Table browsing and successful fleet responses do not prove that the separate incident database is configured.
+**Require `/api/readiness` to pass.** Gunicorn imports `app:app`, so it does not execute the live startup guard inside `if __name__ == "__main__"` in [backend/app.py](backend/app.py). The web process can start successfully while database configuration is missing or broken. Live-mode failures show unavailable telemetry, not invented healthy data or automatic demo fallback.
 
-For an environment where anonymous access is explicitly allowed and there is no sign-in gate, this PowerShell liveness check is also available:
+Readiness performs read-only checks; it does not insert an incident. Row-security policies, constraints, and triggers can still reject a real write. If explicitly approved, submit a clearly labeled test incident through the UI and verify it in the selected incident database. This creates a real row. Successful UI rendering, table browsing, or ID allocation is not proof of incident persistence.
+
+Demo controls are disabled by `DBPULSE_ALLOW_DEMO=0`; do not expect simulated anomaly buttons as part of normal verification. For an explicitly approved demo environment only, set `DBPULSE_ALLOW_DEMO=1` and restart. Failed real database reads still remain unavailable, and demo mode never substitutes for persisted incident receipts.
+
+For environments that explicitly permit unauthenticated probes, these checks are available; otherwise use an authenticated browser or approved API authentication flow:
 
 ```powershell
 Invoke-RestMethod -Uri "$baseUrl/healthz"
+Invoke-RestMethod -Uri "$baseUrl/api/readiness"
 ```
 
-With required authentication, an unauthenticated command may return 401/403 or sign-in HTML. Use the authenticated browser or an approved API authentication flow; do not disable authentication just to make a smoke test pass.
+A 401/403 or sign-in page may be the authentication boundary, not an application failure. Do not disable authentication to test.
 
-## 7. Troubleshooting and redeployment
+## 7. Troubleshoot and Redeploy
 
-### Recover from a startup 503 without Azure CLI
-
-If the site itself returns 503, open the Web App `ilb3790team39python` in the Azure portal. Under **Settings > Configuration > Stack settings**, replace **Startup Command** with this single line to bypass a CRLF-affected Bash script:
-
-```bash
-gunicorn --chdir backend --bind 0.0.0.0:8000 --workers 1 --timeout 120 --access-logfile - --error-logfile - app:app
-```
-
-Select **Save/Apply**, then restart the Web App. This restarts the running application and skips the script's frontend-file check. It assumes the built-in Linux Python stack's default port and successfully installed dependencies. Open **Monitoring > Log stream** and check for Gunicorn startup or the first error/traceback. Test `/healthz` in your authenticated browser; expect HTTP 200 with `status: ok`. Do not change database firewall or authentication settings to fix a startup failure.
-
-The source startup script has been converted to LF and the local `dbpulse-deploy.zip` rebuilt. Deploy that corrected archive before returning Startup Command to `bash startup.sh`. A successful local archive check does not verify live Azure startup. If 503 continues, share the first startup error from Log stream with credentials, tokens, and connection strings removed.
-
-Stream runtime logs when needed; press Ctrl+C when finished:
+Stream runtime logs as needed, then press Ctrl+C:
 
 ```powershell
 az webapp log tail --resource-group $resourceGroup --name $appName
 ```
 
-| Symptom | Check/fix |
+| Symptom | Check |
 | --- | --- |
-| Default Azure landing page | Confirm deployment completed, Python stack is selected, and Startup Command is `bash startup.sh` |
-| Startup reports missing frontend | Rebuild React and confirm the ZIP has `dist/index.html` at the expected root level |
-| Bash errors mentioning `\r` or invalid options | Convert the startup script to LF, recreate the ZIP, and redeploy |
-| `ModuleNotFoundError`, missing Gunicorn, or pip skipped | Include both requirements files, enable `SCM_DO_BUILD_DURING_DEPLOYMENT`, and inspect Oryx logs; never upload a Windows virtual environment |
-| 502/503 from the site itself | Inspect startup/import failures, Gunicorn bind address, runtime version, memory pressure, and build logs |
-| Dashboard loads but database health is 503 | Check hostname, Key Vault resolution, credentials, firewall/private DNS, all three database names, and monitoring/table grants |
-| Incident endpoints return 503 | Check `INCIDENT_DATABASE`, table initialization, `SELECT`/`INSERT` grants, and duplicate incident IDs |
-| AI falls back despite `configured: true` | Check real deployment name, endpoint, key validity, quota/network access, and runtime logs; the current managed-identity path is VM-specific |
-| Key Vault reference is unresolved | Check managed identity, RBAC/access policy, secret URI, network/DNS access, and reference status in the portal |
-| Scenario/timeline changes appear inconsistent | Confirm `WEB_CONCURRENCY=1` and one App Service instance; restarting resets in-memory data |
-| Sign-in page or 401/403 during checks | Confirm intended user assignment, tenant, access restrictions, and authenticated browser session |
-| Frontend looks stale | Rebuild and redeploy a fresh ZIP, then refresh the browser; verify the new asset bundle is served |
+| Startup 503 or Gunicorn missing | Python/Linux Code stack, remote build logs, `SCM_DO_BUILD_DURING_DEPLOYMENT=true`, both requirements files, and incompatible package/run-from-package settings |
+| `Missing dist/index.html` | Frontend build succeeded; ZIP has no enclosing directory; `dist` was included |
+| Bash errors containing `\r` or `bad interpreter` | Recreate and redeploy using the packaging block, which normalizes staged shell line endings |
+| `/healthz` passes but readiness is 503 | Inspect `connection` versus `incident_storage` in readiness; check effective settings, secrets/Key Vault resolution, URL overrides, network/DNS, database names, schema, and privileges |
+| Fleet works but incident submission is 503 | Separate incident database configuration, schema/defaults, insert/sequence permissions, row-security policies, and triggers |
+| Rules appear instead of cloud output | `AGENT_PROVIDER`, endpoint/model/key, `AZURE_FOUNDRY_USE_MANAGED_IDENTITY=false`, provider errors, and inference network access |
+| No monitoring after closing browser | Expected for this web-only startup; Always On does not launch the standalone monitoring worker |
+| Inconsistent/reset timeline or simulation | Multiple instances/workers or process restart; state is in memory |
 
-Do not hard-code `/home/site/wwwroot` into the startup command. Python remote builds can run from an extracted application path under `/tmp`; use project-relative paths as the existing startup script does.
-
-For updates, repeat sections 4-6 with a fresh ZIP. To roll back, deploy your retained known-good package and verify it again. This does not reverse database changes or App Service settings. No resource deletion or database reset is part of this procedure.
-
-## References
-
-- [Configure Python on Linux App Service](https://learn.microsoft.com/en-us/azure/app-service/configure-language-python)
-- [ZIP deployment and remote build](https://learn.microsoft.com/en-us/azure/app-service/deploy-zip)
-
-These instructions prepare deployment to your existing resources; no Azure deployment has been executed as part of writing this document.
+For redeployment, repeat build, package, deploy, and readiness verification. To roll back, deploy your retained known-good ZIP to the same target and restore any associated configuration changes through the approved process. Do not restore or reseed databases as part of an application rollback. Share only sanitized errors when requesting help, never secret-bearing settings exports or connection strings.
